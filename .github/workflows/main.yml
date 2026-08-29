@@ -41,6 +41,10 @@ jobs:
           - leg: modern
             python_version: '3.12'
             pyinstaller: 'pyinstaller==6.22.2'
+            # PyInstaller 6.x does not import pkg_resources, so this leg tracks
+            # current setuptools. Do not pin it - the modern leg is what proves the
+            # app builds against today's toolchain.
+            setuptools: 'setuptools'
             requirements: 'build/requirements.txt'
             spec: './build/main.spec'
             source_ref: ''
@@ -54,6 +58,18 @@ jobs:
           - leg: baseline
             python_version: '3.10'
             pyinstaller: 'pyinstaller==5.1'
+            # PyInstaller 5.1 does `import pkg_resources` at the top of its own
+            # __init__.py. setuptools 82.0.0 (released 2026-02-08) REMOVED the
+            # pkg_resources module outright - "pkg_resources has been removed from
+            # Setuptools" (setuptools changelog v82.0.0, pypa/setuptools#3085) - so an
+            # unpinned `pip install --upgrade setuptools` breaks this leg with
+            # `ModuleNotFoundError: No module named 'pkg_resources'` before PyInstaller
+            # can even print its version. 81.x is the last series that still ships it.
+            #
+            # The fix belongs HERE and not on the PyInstaller pin: the entire purpose
+            # of this leg is to reproduce the original toolchain as a control, so
+            # bumping it to PyInstaller 6.x would delete the thing being measured.
+            setuptools: 'setuptools<82'
             requirements: 'build/requirements-baseline.txt'
             spec: './build/main-baseline.spec'
             source_ref: 'b9ea7bf'
@@ -81,9 +97,18 @@ jobs:
       - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade setuptools wheel
+          python -m pip install --upgrade "${{ matrix.setuptools }}" wheel
           pip install ${{ matrix.pyinstaller }}
           pip install -r ${{ matrix.requirements }}
+
+      # Runs after every install, so it also catches a transitive dependency quietly
+      # dragging setuptools back up over the 82 boundary. Fails with an obvious
+      # message instead of an opaque traceback from inside PyInstaller's __init__.
+      - name: Verify pkg_resources is importable
+        if: matrix.leg == 'baseline'
+        run: |
+          python -c "import setuptools; print('setuptools', setuptools.__version__)"
+          python -c "import pkg_resources; print('pkg_resources OK ->', pkg_resources.__file__)"
 
       - name: Report resolved toolchain and dependency versions
         run: |
@@ -94,11 +119,26 @@ jobs:
           pip freeze
 
       - name: Compile to exe
+        # Consumed by build/version_info.py, which build/main.spec loads to produce
+        # the Windows version resource. The baseline spec ignores these entirely -
+        # it stays a faithful control with no version resource. Every one of them is
+        # optional: version_info.py falls back to a static default if any is missing
+        # or unparseable, so a build can never fail on version derivation.
+        env:
+          DAP_BUILD_NUMBER: ${{ github.run_number }}
+          DAP_GIT_SHA: ${{ github.sha }}
+          DAP_GIT_REF: ${{ github.ref_name }}
         run: pyinstaller ${{ matrix.spec }}
 
       - name: Report build output
         run: |
           Get-ChildItem -Path ./dist | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+
+      - name: Report embedded version resource
+        if: matrix.leg == 'modern'
+        run: |
+          $info = (Get-Item ./dist/dap.exe).VersionInfo
+          $info | Format-List FileVersion, ProductVersion, FileDescription, ProductName, OriginalFilename, LegalCopyright, Comments
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

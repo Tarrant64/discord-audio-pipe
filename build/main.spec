@@ -43,12 +43,72 @@ try:
 except Exception:  # davey not installed / not importable at build time
     davey_binaries = []
 
+
+# ---------------------------------------------------------------------------
+# Windows version resource
+# ---------------------------------------------------------------------------
+# Without this the exe reports FileVersion/ProductVersion 0.0.0.0 with an empty
+# CompanyName / FileDescription / OriginalFilename, which makes a binary found on
+# disk impossible to identify. `build/version_info.py` builds the VSVersionInfo
+# structure; it reads DAP_VERSION / DAP_BUILD_NUMBER / DAP_GIT_SHA / DAP_GIT_REF
+# from the environment (CI sets them) and falls back to a static default otherwise.
+#
+# EXE(version=...) accepts either a path to a version-info text file or an
+# already-constructed VSVersionInfo object; we pass the object because a text file
+# is eval()'d as a single expression and so cannot derive anything at build time.
+#
+# This must never be able to fail the build: any problem loading the module -- it is
+# missing, it is malformed, or PyInstaller.utils.win32 is unimportable because we are
+# building on a non-Windows host -- degrades to `version=None`, i.e. exactly the
+# behaviour before this block existed.
+def _load_version_resource():
+    try:
+        import importlib.util
+
+        module_path = os.path.join(SPECPATH, 'version_info.py')
+        if not os.path.isfile(module_path):
+            print('[main.spec] build/version_info.py not found; '
+                  'building without a version resource')
+            return None
+
+        module_spec = importlib.util.spec_from_file_location(
+            'dap_version_info', module_path
+        )
+        if module_spec is None or module_spec.loader is None:
+            return None
+
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module.build_version_info()
+    except Exception as exc:  # noqa: BLE001 - never fail the build over metadata
+        print('[main.spec] version resource unavailable (%r); '
+              'building without it' % (exc,))
+        return None
+
+
+version_resource = _load_version_resource()
+
 a = Analysis(
     [os.path.join(DATAPATH, 'main.pyw')],
     pathex=[DATAPATH],
     binaries=davey_binaries,
     datas=[(os.path.join(DATAPATH, 'assets'), './assets')],
-    hiddenimports=['PyQt6', 'discord', 'sounddevice', 'davey'],
+    # `logging_setup`, `instrumentation` and `logging.handlers` are all reached by
+    # ordinary top-level `import` statements (main.pyw imports the first two, and
+    # logging_setup does `import logging.handlers`), so PyInstaller's static analysis
+    # already finds them - DATAPATH is both the entry script's directory and on
+    # pathex. They are listed anyway as cheap insurance: a duplicate hidden import is
+    # a no-op, whereas a future refactor that moves one of them behind a conditional
+    # or a lazy import would silently produce an exe that dies on startup.
+    hiddenimports=[
+        'PyQt6',
+        'discord',
+        'sounddevice',
+        'davey',
+        'logging.handlers',
+        'logging_setup',
+        'instrumentation',
+    ],
     hookspath=[SPECPATH],
     hooksconfig={},
     runtime_hooks=[],
@@ -134,4 +194,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=os.path.join(DATAPATH, 'assets', 'favicon.ico'),
+    version=version_resource,
 )
