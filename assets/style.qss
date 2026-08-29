@@ -17,6 +17,8 @@
      danger (close)    #D83C3E
      status healthy    #43B581   degrading #E9A23C   failing #F87171
      status idle       #9AA0A6
+     on-air fill       #2E7D5B   hover #35845F   pressed #286B4E
+     muted fill        #E9A23C   hover #F0AE50   pressed #D08F2E
 
    Contrast (WCAG 2.1, computed):
      #E8EAED on #24262C panel ....... 12.6:1
@@ -34,6 +36,37 @@
      #E9A23C degrading ............... 7.8:1
      #F87171 failing ................. 6.1:1
      #9AA0A6 idle / metric text ...... 6.4:1
+
+   Connect / Disconnect button, added with the connection state machine.
+   Text ratios first (all clear 4.5:1), then the non-text rings and borders
+   (which need 3:1, measured against BOTH neighbouring surfaces):
+     #E8EAED idle label on #1B1D21 ... 14.0:1
+     #43B581 idle hover on #212429 .... 6.1:1
+     #38976C idle pressed on #17191C .. 4.9:1
+     #E9A23C connecting on #1B1D21 .... 7.8:1   (also disconnecting)
+     white on #2E7D5B live fill ....... 5.0:1
+     white on #35845F live hover ...... 4.6:1
+     white on #286B4E live pressed .... 6.4:1
+     #A6C4B5 on #26493C live disabled . 5.3:1   (disabled text is exempt)
+     #F87171 failed on #1B1D21 ........ 6.1:1
+     #FCA5A5 failed hover on #212429 .. 8.2:1
+     #D85C5C failed pressed on #17191C  4.7:1
+     #A9B0F7 focus ring vs well ....... 8.2:1   vs panel 7.4:1
+     #FFFFFF live focus ring vs fill .. 5.0:1   vs panel 15.1:1
+     #43B581 live border vs panel ..... 5.9:1
+     #E9A23C busy border vs panel ..... 7.0:1
+     #F87171 failed border vs panel ... 5.5:1
+
+   Mute button, checked (= muted):
+     #131417 on #E9A23C amber fill .... 8.5:1
+     #131417 on #F0AE50 hover ......... 9.5:1
+     #131417 on #D08F2E pressed ....... 6.7:1
+     #131417 focus ring vs the fill ... 9.5:1
+     #E0D3B8 on #6B5528 disabled ...... 4.8:1   (should be unreachable)
+
+   Muted is amber, not red: it is a state the user chose and will undo. Red
+   is reserved for the two things that are actually wrong — a failed connect
+   and a failing stream.
 
    The strip's failing colour is #F87171, not the #D83C3E used for the close
    button: #D83C3E is only 3.7:1 as text on #1B1D21, which is fine for a
@@ -358,6 +391,144 @@ QScrollBar::sub-page:horizontal {
 }
 
 
+/* --- connect / disconnect button ----------------------------------------- */
+
+/* One button per connection row, not two. The LABEL is the next action
+   ("Connect" / "Disconnect" / "Retry"); the COLOUR below is the current
+   state, published by gui.py as the dynamic property link="..." whose values
+   are the constants in connection_state.py. Qt does not re-evaluate an
+   attribute selector when a property changes, so gui.py does the
+   unpolish/polish pair after setting it.
+
+   The four looks are distinguishable without reading the word:
+     idle           grey outline
+     connecting     amber outline, dimmed (the button is disabled)
+     live           SOLID GREEN -- the row is on air
+     disconnecting  amber outline, dimmed
+     failed         red outline
+
+   Green-on-"Disconnect" is deliberate: the fill states what the row IS, the
+   word states what the click DOES. */
+
+QPushButton#connect {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    font-weight: 500;
+    min-height: 34px;
+    min-width: 108px;
+    max-width: 108px;
+    padding: 0px;
+    outline: none;
+}
+
+/* -- idle: the offered action is "Connect" -- */
+
+QPushButton#connect[link="idle"] {
+    background-color: #1B1D21;
+    border-color: #383C44;
+    color: #E8EAED;
+}
+
+QPushButton#connect[link="idle"]:hover {
+    background-color: #212429;
+    border-color: #43B581;
+    color: #43B581;
+}
+
+QPushButton#connect[link="idle"]:pressed {
+    background-color: #17191C;
+    border-color: #38976C;
+    color: #38976C;
+}
+
+/* disabled here means "the selection is not complete yet"; the tooltip says
+   which of device / server / channel is still missing */
+QPushButton#connect[link="idle"]:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+/* -- in flight: always disabled, never cancellable -- */
+
+QPushButton#connect[link="connecting"],
+QPushButton#connect[link="connecting"]:disabled,
+QPushButton#connect[link="disconnecting"],
+QPushButton#connect[link="disconnecting"]:disabled {
+    background-color: #1B1D21;
+    border-color: #E9A23C;
+    color: #E9A23C;
+}
+
+/* -- live: on air -- */
+
+QPushButton#connect[link="live"] {
+    background-color: #2E7D5B;
+    border-color: #43B581;
+    color: #FFFFFF;
+}
+
+QPushButton#connect[link="live"]:hover {
+    background-color: #35845F;
+    border-color: #5FC79A;
+}
+
+QPushButton#connect[link="live"]:pressed {
+    background-color: #286B4E;
+    border-color: #38976C;
+}
+
+QPushButton#connect[link="live"]:disabled {
+    background-color: #26493C;
+    border-color: #2E5A49;
+    color: #A6C4B5;
+}
+
+/* -- failed: the offered action is "Retry" -- */
+
+QPushButton#connect[link="failed"] {
+    background-color: #1B1D21;
+    border-color: #F87171;
+    color: #F87171;
+}
+
+QPushButton#connect[link="failed"]:hover {
+    background-color: #212429;
+    border-color: #FCA5A5;
+    color: #FCA5A5;
+}
+
+QPushButton#connect[link="failed"]:pressed {
+    background-color: #17191C;
+    border-color: #D85C5C;
+    color: #D85C5C;
+}
+
+QPushButton#connect[link="failed"]:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+/* Last, so they win the specificity tie against the [link="..."] rules above
+   and re-colour the ring without touching the fill. Two rules because a
+   lavender ring on the solid-green live fill is only 2.4:1 against it, and a
+   focus indicator has to be visible against BOTH the thing it surrounds and
+   the panel outside it. White clears 3:1 on both (5.0:1 vs the green fill,
+   15.1:1 vs the panel); lavender clears both on the dark outline states
+   (8.2:1 vs the control well, 7.4:1 vs the panel). */
+QPushButton#connect:focus {
+    border-color: #A9B0F7;
+}
+
+QPushButton#connect[link="live"]:focus {
+    border-color: #FFFFFF;
+}
+
+
 /* --- mute button --------------------------------------------------------- */
 
 QPushButton#mute {
@@ -393,6 +564,55 @@ QPushButton#mute:disabled {
     background-color: #333A5C;
     border-color: #333A5C;
     color: #8A90A8;
+}
+
+/* The button is checkable, so muted is a latched colour and not only a word
+   swap. It keeps the word too -- "Resume" -- because colour is never allowed
+   to be the only channel, but an amber button reads across several rows at a
+   glance in a way that reading five labels does not.
+
+   Amber rather than red: muted is a state the user chose and will undo, not
+   a fault. Red is reserved for the failure states.
+
+   These come after the plain rules above: an id + pseudo-state selector ties
+   with another id + pseudo-state selector on specificity, so source order is
+   what decides, and :checked:hover has to be spelled out for the same
+   reason. */
+
+QPushButton#mute:checked {
+    background-color: #E9A23C;
+    border-color: #E9A23C;
+    color: #131417;
+}
+
+QPushButton#mute:checked:hover {
+    background-color: #F0AE50;
+    border-color: #F0AE50;
+    color: #131417;
+}
+
+QPushButton#mute:checked:pressed {
+    background-color: #D08F2E;
+    border-color: #D08F2E;
+    color: #131417;
+}
+
+/* Dark ring, not the lavender used elsewhere: on an amber fill the light
+   ring vanishes (1.8:1) while #131417 reads at 9.5:1 against it. */
+QPushButton#mute:checked:focus {
+    background-color: #F0AE50;
+    border-color: #131417;
+    color: #131417;
+}
+
+/* Should not be reachable -- gui.py clears the mute whenever the row leaves
+   LIVE, and the button is only enabled in LIVE -- but a latched control that
+   greys out without un-latching would be asserting a mute that is not in
+   effect, so it is defined rather than left to the plain :disabled rule. */
+QPushButton#mute:checked:disabled {
+    background-color: #6B5528;
+    border-color: #6B5528;
+    color: #E0D3B8;
 }
 
 

@@ -4,6 +4,7 @@ import functools
 import sound
 import asyncio
 import config
+import connection_state
 import instrumentation
 import logging_setup
 import logging
@@ -117,6 +118,56 @@ STATE_IDLE = "idle"
 STATE_OK = "ok"
 STATE_WARN = "warn"
 STATE_FAIL = "fail"
+
+
+# ===========================================================================
+# Connect / Disconnect controls
+# ===========================================================================
+
+# One button, not two.
+#
+# The row already carries three dropdowns, a mute button and the "+" that
+# adds another row, in a frameless window that is only ever as wide as its
+# contents ask for. A second dedicated button would widen every row by
+# another ~104px to show a control that is disabled in every state but one --
+# a permanently dead half of the pair, and a disabled button is a *weaker*
+# state signal than a live one carrying a word.
+#
+# So: one button whose LABEL is the next action and whose COLOUR is the
+# current state. The pairing is unambiguous in all five states -- neutral
+# "Connect", amber "Connecting…", green-filled "Disconnect" (green as in
+# on-air, which is what the row is), amber "Leaving…", red-outlined "Retry"
+# -- and the four looks are distinguishable without reading the word, which
+# a two-button layout would not have been either.
+#
+# The usual objection to a toggling button is that the label can change
+# under a moving cursor and invert what the next click does. It cannot here:
+# every transition passes through CONNECTING or DISCONNECTING, and the
+# button is *disabled* for the whole of both. There is no moment where the
+# label flips from "Connect" to "Disconnect" while the button is clickable.
+CONNECT_LABELS = {
+    connection_state.IDLE: "Connect",
+    connection_state.CONNECTING: "Connecting…",
+    connection_state.LIVE: "Disconnect",
+    connection_state.DISCONNECTING: "Leaving…",
+    connection_state.FAILED: "Retry",
+}
+
+CONNECT_TIPS = {
+    connection_state.IDLE:
+        "Join the selected voice channel and start streaming the selected"
+        " audio device.",
+    connection_state.CONNECTING:
+        "Joining the channel. This waits up to 10 seconds.",
+    connection_state.LIVE:
+        "Leave the voice channel.\n\n"
+        "Your device, server and channel stay selected, so pressing Connect"
+        " again rejoins in one click.",
+    connection_state.DISCONNECTING:
+        "Leaving the channel.",
+    connection_state.FAILED:
+        "The last attempt to join did not succeed. Press to try again.",
+}
 
 
 # ===========================================================================
@@ -357,6 +408,22 @@ class Dropdown(QComboBox):
 
 
 class SVGButton(QPushButton):
+    """Push button that can show a spinner in place of its label.
+
+    The spinner used to be driven straight off ``setEnabled``: disabled meant
+    "show the spinner". That held only while the button was disabled for
+    exactly one reason -- the window being gated until the bot logs in.
+
+    It is no longer true. The mute button is now disabled in every state
+    except LIVE, which is most of the time, so tying the spinner to
+    enablement would leave a "loading" animation permanently spinning on an
+    idle row -- an indicator that says "wait" when nothing is happening, on
+    every row, forever.
+
+    Busy is therefore its own explicit flag with one caller (the pre-login
+    gate), which is what it always actually meant.
+    """
+
     def __init__(self, text=None):
         super(SVGButton, self).__init__(text)
 
@@ -369,17 +436,38 @@ class SVGButton(QPushButton):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.addWidget(self.svg)
 
-    def setEnabled(self, enabled):
-        super().setEnabled(enabled)
-        self.svg.setVisible(not enabled)
+    def set_busy(self, busy):
+        """Show the spinner instead of the label."""
+        self.svg.setVisible(bool(busy))
 
 
 class Connection:
+    """One row: a device, a server, a channel, a Connect button and a mute.
+
+    Rows are fully independent. Each owns its own :class:`~connection_state.
+    LinkState`, its own voice client and its own audio stream, so one row
+    failing to join, or being disconnected, says nothing about any other.
+
+    Selecting a channel does **not** join it. Selection only stages the
+    intent; the row enters voice when, and only when, the Connect button (or
+    auto-connect, through the same function) says so. Everything the user can
+    see about that -- the button's label and colour, which dropdowns are
+    editable, whether mute does anything, what the status strip says -- is
+    derived in one place, :meth:`refresh_controls`, from one value,
+    ``self.link.state``.
+    """
+
     def __init__(self, layer, parent):
         self.stream = instrumentation.make_stream()
         self.parent = parent
         self.voice = None
         self.poller = None
+
+        #: The window-wide gate (False until the bot has logged in). Composed
+        #: with the link state in refresh_controls rather than fighting it:
+        #: a control is enabled when the window allows it *and* the state
+        #: makes it meaningful.
+        self.window_enabled = False
 
         #: Mirrors the mute button, so the saved profile does not have to
         #: interrogate a VoiceClient that may not exist. ``is_playing()``
@@ -400,31 +488,184 @@ class Connection:
         for device, idx in parent.devices.items():
             self.devices.addItem(device, idx)
 
+        # connect / disconnect
+        self.connect_btn = QPushButton(
+            CONNECT_LABELS[connection_state.IDLE]
+        )
+        self.connect_btn.setObjectName("connect")
+        self.connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
         # mute
+        #
+        # Checkable, so "muted" is a held-down colour state and not only a
+        # word. The word stays too -- colour is never the only channel -- but
+        # a latched amber button is legible at a glance across several rows
+        # in a way that reading five labels is not.
         self.mute = SVGButton("Mute")
         self.mute.setObjectName("mute")
+        self.mute.setCheckable(True)
         self.mute.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # add widgets
         parent.layout.addWidget(self.devices, layer, 0)
         parent.layout.addWidget(self.servers, layer, 1)
         parent.layout.addWidget(self.channels, layer, 2)
-        parent.layout.addWidget(self.mute, layer, 3)
+        parent.layout.addWidget(self.connect_btn, layer, 3)
+        parent.layout.addWidget(self.mute, layer, 4)
+
+        # The state machine. Built after the widgets, because its readiness
+        # check reads the dropdowns and its change observer repaints them.
+        self.link = connection_state.LinkState(
+            name="row %d" % (layer - 1),
+            ready=self.selection_complete,
+            on_change=self.on_link_changed,
+        )
 
         # events
         #
-        # The two async ones go through guarded methods rather than bare
-        # lambdas. asyncio.create_task() raises RuntimeError when there is
-        # no running loop, and an exception escaping a slot back into Qt is
+        # The async one goes through a guarded method rather than a bare
+        # lambda. asyncio.create_task() raises RuntimeError when there is no
+        # running loop, and an exception escaping a slot back into Qt is
         # fatal under PyQt6 -- it calls abort(), taking the app down with no
         # traceback in any log file. See
         # logging_setup.install_excepthook().
         self.devices.changed.connect(self.change_device)
         self.servers.changed.connect(self.on_server_changed)
         self.channels.changed.connect(self.on_channel_changed)
+        self.connect_btn.clicked.connect(self.on_connect_clicked)
         self.mute.clicked.connect(self.toggle_mute)
 
+        self.refresh_controls()
+
+    # -- what the row has selected -----------------------------------------
+
+    def selection_complete(self):
+        """All three choices made, so joining is even a meaningful request.
+
+        ``currentData() is not None`` and not ``currentIndex() >= 0``: the
+        channel dropdown carries a literal "None" entry whose data is
+        ``None``, which is a *deselection*, and the device dropdown's data is
+        a PortAudio index that is legitimately ``0``.
+        """
+        return (
+            self.devices.currentData() is not None
+            and self.servers.currentData() is not None
+            and self.channels.currentData() is not None
+        )
+
+    def missing_selection(self):
+        """Which of the three are still unset, in left-to-right order."""
+        missing = []
+
+        if self.devices.currentData() is None:
+            missing.append("a device")
+        if self.servers.currentData() is None:
+            missing.append("a server")
+        if self.channels.currentData() is None:
+            missing.append("a channel")
+
+        return missing
+
+    # -- rendering the state ------------------------------------------------
+
+    def on_link_changed(self, old, new):
+        """Observer on the state machine. Repaint, then tell the window."""
+        self.refresh_controls()
+
+        status = getattr(self.parent, "status", None)
+
+        if status is not None:
+            status.refresh()
+
+    def refresh_controls(self):
+        """Derive every control's label, enablement and tooltip from state.
+
+        The single place that answers "what should the row look like now?".
+        Nothing else sets enabled/checked/text on these widgets, which is the
+        whole point: before this there were four opinions about whether the
+        row was connected and they could disagree.
+
+        Never raises -- it runs from a state observer, which runs from slots.
+        """
+        try:
+            state = self.link.state
+            on = self.window_enabled
+            busy = self.link.is_busy
+            live = self.link.is_live
+            ready = self.selection_complete()
+
+            # The device may be re-picked mid-broadcast: change_device
+            # re-plugs the stream into the running player, which is a
+            # deliberate feature of a live audio tool. Server and channel may
+            # not -- allowing that would let the staged selection and the
+            # channel actually being streamed to drift apart, which is the
+            # exact confusion this change exists to remove.
+            self.devices.setEnabled(on and not busy)
+            self.servers.setEnabled(on and not busy and not live)
+            self.channels.setEnabled(on and not busy and not live)
+
+            # Mute only means something while something is playing.
+            self.mute.setEnabled(on and live)
+
+            self.connect_btn.setEnabled(on and not busy and (live or ready))
+            self.connect_btn.setText(CONNECT_LABELS[state])
+            self.connect_btn.setToolTip(self.connect_tooltip(state, on, ready))
+            self._apply_link_property(state)
+
+        except Exception:
+            logging.exception("Error refreshing row controls")
+
+    def connect_tooltip(self, state, on, ready):
+        """Say what the button will do, or why it will not do anything."""
+        if not on:
+            return "Waiting for the bot to finish logging in."
+
+        if state in (connection_state.IDLE, connection_state.FAILED) \
+                and not ready:
+            missing = self.missing_selection()
+            return (
+                "Pick " + " and ".join(missing) + " first.\n\n"
+                "Choosing a channel no longer joins it on its own -- this"
+                " button is what joins."
+            )
+
+        tip = CONNECT_TIPS[state]
+
+        if state == connection_state.FAILED and self.link.error:
+            tip += "\n\nLast attempt: %s" % self.link.error
+
+        return tip
+
+    def _apply_link_property(self, state):
+        """Publish the state to the stylesheet and force a restyle.
+
+        Qt does not re-evaluate attribute selectors when a dynamic property
+        changes, hence the unpolish/polish pair -- the same trick the status
+        strip uses for its own ``state`` property.
+        """
+        for widget in (self.connect_btn,):
+            if widget.property("link") != state:
+                widget.setProperty("link", state)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+
     # -- slots --------------------------------------------------------------
+
+    @guarded_slot
+    def on_connect_clicked(self, *_):
+        """The Connect / Disconnect button. Carries ``checked``, hence ``*_``.
+
+        Dispatch only. Both branches claim the state machine *synchronously*
+        before scheduling any coroutine, which is what makes a second click
+        in the same event-loop turn a no-op instead of a second join.
+        """
+        try:
+            if self.link.is_live:
+                self.start_disconnect()
+            else:
+                self.start_connect()
+        except Exception:
+            logging.exception("Error dispatching the connect button")
 
     @guarded_slot
     def on_server_changed(self, deselected, selected):
@@ -435,10 +676,20 @@ class Connection:
 
     @guarded_slot
     def on_channel_changed(self, *_):
+        """Picking a channel STAGES it. It does not join it.
+
+        This used to be the connect action -- ``change_channel`` joined the
+        channel as a side effect of the dropdown changing. That is gone
+        deliberately; see the README's "Connecting and disconnecting"
+        section, which flags it as a breaking change.
+        """
         try:
-            asyncio.create_task(self.change_channel())
+            self.link.clear_failure()
+            self.refresh_controls()
         except Exception:
-            logging.exception("Error dispatching change_channel")
+            logging.exception("Error on channel selection")
+        finally:
+            self.parent.profile_changed()
 
     @staticmethod
     def resize_combobox(combobox):
@@ -472,16 +723,21 @@ class Connection:
             window.resize(hint, window.height())
 
     def setEnabled(self, enabled):
-        self.devices.setEnabled(enabled)
-        self.servers.setEnabled(enabled)
-        self.channels.setEnabled(enabled)
+        """The window-wide gate. Per-control enablement is state-derived."""
+        self.window_enabled = bool(enabled)
 
-        self.mute.setEnabled(enabled)
-        self.mute.setText("Mute" if enabled else "")
+        # The spinner means "the app is still starting up", which is the one
+        # thing this gate expresses and the link state does not.
+        self.mute.set_busy(not self.window_enabled)
+        self.mute.setText(self.mute_label())
+
+        self.refresh_controls()
 
     def set_servers(self, guilds):
         for guild in guilds:
             self.servers.addItem(guild.name, guild)
+
+        self.refresh_controls()
 
     # -- saved profile ------------------------------------------------------
 
@@ -526,23 +782,41 @@ class Connection:
         try:
             selection = self.devices.currentData()
             logging_setup.log_device(selection, self.devices.currentText().strip())
-            self.mute.setText("Mute")
-            self.muted = False
+            self.link.clear_failure()
+            self.set_muted(False)
 
-            if self.voice is not None:
-                self.voice.stop()
-                self.stream.change_device(selection)
+            if selection is None:
+                # Deliberately does NOT open the stream. sounddevice reads
+                # device=None as "the system default input", and the next
+                # thing this app does with an open stream is broadcast it,
+                # so an unselected device must stay an unopened stream
+                # rather than become a live default microphone.
+                return
 
-                if self.voice.is_connected():
-                    self.voice.play(self.stream, fec=False, signal_type='music', after=instrumentation.make_after())
+            self.stream.change_device(selection)
 
-            else:
-                self.stream.change_device(selection)
+            if self.link.is_live and self.voice is not None:
+                # Re-plug the running player onto the new device. stop()
+                # first and unconditionally: play() refuses while
+                # is_playing(), and is_playing() is exactly the value that
+                # keeps reading True on a dead player thread, so "only stop
+                # if it is playing" would skip the stop on the one case that
+                # needs it. stop() is None-safe in discord.py.
+                try:
+                    self.voice.stop()
+                    self.voice.play(
+                        self.stream, fec=False, signal_type='music',
+                        after=instrumentation.make_after(),
+                    )
+                except Exception:
+                    logging.exception("Error restarting playback on the new device")
+                    self.link.fail("could not switch device while live")
 
         except Exception:
             logging.exception("Error on change_device")
 
         finally:
+            self.refresh_controls()
             self.parent.profile_changed()
 
     async def change_server(self, deselcted, selected):
@@ -550,6 +824,7 @@ class Connection:
             selection = self.servers.itemData(selected)
 
             self.parent.exclude(deselcted, selected)
+            self.link.clear_failure()
             self.channels.clear()
             self.channels.addItem("None", None)
 
@@ -563,66 +838,188 @@ class Connection:
             logging.exception("Error on change_server")
 
         finally:
+            self.refresh_controls()
             self.parent.profile_changed()
 
-    async def change_channel(self):
+    # -- joining and leaving ------------------------------------------------
+    #
+    # There is exactly one way into voice and exactly one way out, and the
+    # Connect button, auto-connect on launch and any future caller all use
+    # them. Auto-connect is not a parallel implementation that happens to do
+    # the same thing -- it literally calls start_connect() and awaits the
+    # task it returns.
+
+    def start_connect(self):
+        """Claim the row and schedule the join. Returns the task, or None.
+
+        Synchronous on purpose. The state flips to CONNECTING *here*, before
+        the coroutine exists, so a second press in the same event-loop turn
+        is refused by the state machine rather than racing an in-flight join.
+        """
+        if not self.link.begin_connect():
+            return None
+
         try:
-            selection = self.channels.currentData()
-            self.mute.setText("Mute")
-            self.muted = False
-            self.setEnabled(False)
+            return asyncio.create_task(self._connect())
+        except Exception:
+            # No running loop. Do not leave the row stranded in CONNECTING
+            # with every control disabled -- that is the hang this state
+            # machine exists to make impossible.
+            logging.exception("Error dispatching connect")
+            self.link.fail("could not start the connection")
+            return None
 
-            if selection is not None:
-                not_connected = (
-                    self.voice is None
-                    or self.voice is not None
-                    and not self.voice.is_connected()
-                )
+    def start_disconnect(self):
+        """Claim the row and schedule the leave. Returns the task, or None."""
+        if not self.link.begin_disconnect():
+            return None
 
-                if not_connected:
-                    self.voice = await selection.connect(timeout=10)
-                else:
-                    await self.voice.move_to(selection)
+        try:
+            return asyncio.create_task(self._disconnect())
+        except Exception:
+            logging.exception("Error dispatching disconnect")
+            # Not FAILED: whatever else is true, the user asked to leave and
+            # the useful next offer is "Connect", not "Retry".
+            self.link.finish_disconnect()
+            return None
 
-                logging_setup.log_event("joined %s / %s", selection.guild, selection)
-                self.poller = instrumentation.attach(self.voice, f" [{selection}]", self.poller)
+    async def _connect(self):
+        """Join the selected channel and start streaming. Never raises."""
+        selection = self.channels.currentData()
 
-                not_playing = (
-                    self.devices.currentData() is not None
-                    and not self.voice.is_playing()
-                )
+        try:
+            if selection is None:
+                self.link.fail("no channel selected")
+                return False
 
-                if not_playing:
-                    self.voice.play(self.stream, fec=False, signal_type='music', after=instrumentation.make_after(f" [{selection}]"))
-
+            if self.voice is not None and self.voice.is_connected():
+                await self.voice.move_to(selection)
             else:
-                if self.voice is not None:
-                    logging_setup.log_event("leaving voice (channel set to None)")
-                    self.poller = instrumentation.detach(self.poller)
-                    await self.voice.disconnect()
+                self.voice = await selection.connect(timeout=10)
+
+            logging_setup.log_event("joined %s / %s", selection.guild, selection)
+            self.poller = instrumentation.attach(
+                self.voice, f" [{selection}]", self.poller
+            )
+
+            if self.devices.currentData() is not None:
+                # See change_device for why the stop() is unconditional.
+                self.voice.stop()
+                self.voice.play(
+                    self.stream, fec=False, signal_type='music',
+                    after=instrumentation.make_after(f" [{selection}]"),
+                )
+
+            self.link.finish_connect()
+            self.set_muted(False)
+            return True
 
         except asyncio.TimeoutError:
-            logging.exception("Timed out connecting to channel. The bot may not have permissions to join the channel due to custom roles.")
+            logging.exception(
+                "Timed out connecting to channel. The bot may not have"
+                " permissions to join the channel due to custom roles."
+            )
+            self.link.fail("timed out after 10s -- check the bot's"
+                           " permissions on that channel")
+            return False
 
         except Exception:
-            logging.exception("Error on change_channel")
+            logging.exception("Error connecting to voice")
+            self.link.fail("see DAP_errors.log")
+            return False
 
         finally:
-            self.setEnabled(True)
+            self.refresh_controls()
             self.parent.profile_changed()
 
-    @guarded_slot
-    def toggle_mute(self, *_):
+    async def _disconnect(self):
+        """Leave voice, keeping the selections and the audio stream.
+
+        Deliberately does not clear a dropdown and does not close
+        ``self.stream``: the point of Disconnect is that Connect afterwards
+        is one click, on the same channel, with the same device already open.
+        """
         try:
+            self.poller = instrumentation.detach(self.poller)
+
             if self.voice is not None:
-                if self.voice.is_playing():
+                logging_setup.log_event("leaving voice (disconnect requested)")
+                self.voice.stop()
+                await self.voice.disconnect()
+
+        except Exception:
+            logging.exception("Error disconnecting from voice")
+
+        finally:
+            # Unconditional, and IDLE rather than FAILED however it went:
+            # after a leave the honest offer is "Connect", and there is no
+            # DISCONNECTING -> FAILED edge for a reason. See
+            # connection_state's module docstring.
+            self.voice = None
+            self.set_muted(False)
+            self.link.finish_disconnect()
+            self.refresh_controls()
+            self.parent.profile_changed()
+
+        return True
+
+    # -- mute ---------------------------------------------------------------
+
+    def mute_label(self):
+        if not self.window_enabled:
+            return ""
+
+        return "Resume" if self.muted else "Mute"
+
+    def set_muted(self, muted):
+        """The single writer for mute. Button, flag and player kept in step.
+
+        Note what is *not* consulted: ``voice.is_playing()``. It is the value
+        the old toggle branched on, and it is the one value here that cannot
+        be trusted -- it returns True forever once the player thread has
+        died, so "if it is playing, pause; else resume" would answer the
+        first click with a pause on a corpse and never come back.
+        """
+        muted = bool(muted) and self.link.is_live
+        changed = muted != self.muted
+
+        try:
+            # Only on an actual change. Calling resume() on a player that was
+            # never paused is harmless but meaningless, and it would fire on
+            # every connect and every disconnect -- noise in the one place
+            # where "did the mute apply?" has to be readable.
+            if changed and self.voice is not None:
+                # Both are None-safe in discord.py when no player exists.
+                if muted:
                     self.voice.pause()
-                    self.mute.setText("Resume")
-                    self.muted = True
                 else:
                     self.voice.resume()
-                    self.mute.setText("Mute")
-                    self.muted = False
+        except Exception:
+            logging.exception("Error applying mute to the voice client")
+
+        self.muted = muted
+
+        if self.mute.isChecked() != muted:
+            self.mute.blockSignals(True)
+            try:
+                self.mute.setChecked(muted)
+            finally:
+                self.mute.blockSignals(False)
+
+        self.mute.setText(self.mute_label())
+
+    @guarded_slot
+    def toggle_mute(self, checked=False, *_):
+        """The mute button. It is checkable, so ``clicked`` carries a bool."""
+        try:
+            if not self.link.is_live:
+                # Not something the user can normally reach -- the button is
+                # disabled off-air -- but a programmatic click must not leave
+                # the check mark asserting a mute that is not in effect.
+                self.set_muted(False)
+                return
+
+            self.set_muted(checked)
 
         except Exception:
             logging.exception("Error on toggle_mute")
@@ -758,11 +1155,20 @@ class StatusStrip(QFrame):
     # -- classification -----------------------------------------------------
 
     @staticmethod
-    def evaluate(snap):
+    def evaluate(snap, link=None):
         """Turn a snapshot into ``(state, word, detail, tooltip_lines)``.
 
-        Pure and side-effect free, which is what makes the four rendered
-        states testable without a Discord connection.
+        Pure and side-effect free, which is what makes the rendered states
+        testable without a Discord connection.
+
+        ``link`` is the window's aggregate connection state (see
+        :meth:`GUI.link_state`) and it is *authoritative* about whether the
+        app is in voice. The strip used to infer that from instrumentation
+        sample counts, which made it a fifth independent opinion on the
+        question and let it disagree with the buttons beside it. Health
+        metrics are still what they always were -- measurements of a stream
+        -- but they are only consulted once the state machine says there is a
+        stream to measure.
         """
         latency = snap.get("latency_ms")
         drops = snap.get("drops")
@@ -808,11 +1214,33 @@ class StatusStrip(QFrame):
             " they have not been calibrated against a real failure yet.",
         ]
 
-        # -- nothing to report -------------------------------------------
-        if not snap.get("connections"):
+        # -- what the state machine says ----------------------------------
+        #
+        # Every state but LIVE is answered here and returns. Only LIVE falls
+        # through to the metrics below, because only LIVE means there is
+        # something to measure.
+        if link is not None:
+            if link == connection_state.FAILED:
+                return (STATE_FAIL, "Failed",
+                        "could not join — press Retry", tip)
+            if link == connection_state.CONNECTING:
+                return STATE_IDLE, "Connecting", "joining voice", tip
+            if link == connection_state.DISCONNECTING:
+                return STATE_IDLE, "Disconnecting", "leaving voice", tip
+            if link != connection_state.LIVE:
+                return STATE_IDLE, "Idle", "not connected", tip
+
+            if not snap.get("voice_samples"):
+                return STATE_IDLE, "Starting", "waiting for first sample", tip
+
+        # -- nothing to report --------------------------------------------
+        #
+        # The fallback for a caller that has no link state to offer: the old
+        # inference, kept so evaluate() stays usable on a bare snapshot.
+        elif not snap.get("connections"):
             return STATE_IDLE, "Idle", "not connected", tip
-        if not snap.get("voice_samples"):
-            return STATE_IDLE, "Connecting", "waiting for first sample", tip
+        elif not snap.get("voice_samples"):
+            return STATE_IDLE, "Starting", "waiting for first sample", tip
 
         # -- hard failures, in order of certainty --------------------------
         if snap.get("connected") is False:
@@ -890,11 +1318,13 @@ class StatusStrip(QFrame):
                 widget.style().polish(widget)
 
     @guarded_slot
-    def refresh(self, snap=None):
+    def refresh(self, snap=None, link=None):
         try:
             if snap is None:
                 snap = instrumentation.snapshot()
-            state, word, detail, tip = self.evaluate(snap)
+            if link is None:
+                link = self.gui.link_state()
+            state, word, detail, tip = self.evaluate(snap, link)
         except Exception:
             # A broken readout must never take the app with it, and must
             # never keep showing the last good numbers as if they were live.
@@ -1066,8 +1496,8 @@ class GUI(QMainWindow):
         self.layout.addWidget(device_lb, 1, 0)
         self.layout.addWidget(server_lb, 1, 1)
         self.layout.addWidget(channel_lb, 1, 2)
-        self.layout.addWidget(self.connection_btn, 2, 4)
-        self.layout.addWidget(self.status, STATUS_ROW, 0, 1, 5)
+        self.layout.addWidget(self.connection_btn, 2, 5)
+        self.layout.addWidget(self.status, STATUS_ROW, 0, 1, 6)
 
         # events
         self.connection_btn.clicked.connect(self.add_connection)
@@ -1139,6 +1569,25 @@ class GUI(QMainWindow):
         for connection in self.connections:
             connection.setEnabled(enabled)
 
+    def link_state(self):
+        """The window's one-word answer to "are we in voice?".
+
+        Rows are independent, so there are several answers; this picks the
+        one the status strip should show. ``FAILED`` outranks everything --
+        it is the only state that needs the user -- and ``LIVE`` outranks
+        ``CONNECTING`` so that a running stream's health metrics stay on
+        screen while a *different* row is joining.
+
+        Never raises: it is read from a QTimer callback.
+        """
+        try:
+            return connection_state.summarise(
+                connection.link.state for connection in self.connections
+            )
+        except Exception:
+            logging.exception("Error summarising connection state")
+            return connection_state.IDLE
+
     @guarded_slot
     def add_connection(self, *_):
         # Slot ("+" button) and also called directly by restore_devices().
@@ -1155,7 +1604,7 @@ class GUI(QMainWindow):
                     new_connection.servers.setRowHidden(idx, True)
 
             self.layout.removeWidget(self.connection_btn)
-            self.layout.addWidget(self.connection_btn, layer, 4)
+            self.layout.addWidget(self.connection_btn, layer, 5)
 
             self.connections.append(new_connection)
 
@@ -1170,9 +1619,12 @@ class GUI(QMainWindow):
     # 1. The audio device is stored by NAME and re-resolved to an index at
     #    startup. See Connection.snapshot() and config.resolve_device() for
     #    why an index would be actively dangerous.
-    # 2. Restoring the dropdowns is not the same as connecting. In this app
-    #    picking a channel *is* the connect action, so the restore only goes
-    #    that far when auto_connect is on. Off by default.
+    # 2. Restoring the dropdowns is not the same as connecting. Selection
+    #    only stages the intent -- for the user and for the restore alike --
+    #    and joining voice is a separate, explicit step. The restore takes
+    #    that step only when auto_connect is on, and it takes it by calling
+    #    Connection.start_connect(), the same function the Connect button
+    #    calls. There is no second implementation of "join" to drift.
     #
     # Anything that has since disappeared -- unplugged device, bot kicked
     # from a server, channel deleted or renamed or now permission-gated --
@@ -1421,6 +1873,7 @@ class GUI(QMainWindow):
                 return
 
             self.select_quietly(connection.channels, channel)
+            connection.refresh_controls()
 
             if not auto_connect:
                 logging_setup.log_event(
@@ -1431,12 +1884,28 @@ class GUI(QMainWindow):
                 )
                 return
 
-            await connection.change_channel()
+            # THE SAME ENTRY POINT THE CONNECT BUTTON USES. Not a copy of it,
+            # and not a private variant: start_connect() claims the state
+            # machine and returns the task, exactly as it does for a click.
+            # A None means the machine refused (incomplete selection, or no
+            # running loop), and refusing is the correct outcome -- there is
+            # nothing here to await and nothing to recover.
+            task = connection.start_connect()
 
-            # Only meaningful once something is actually playing.
-            if row.get("muted") and connection.voice is not None:
-                if connection.voice.is_playing():
-                    connection.toggle_mute()
+            if task is None:
+                logging_setup.log_event(
+                    "profile: row %d auto-connect refused (state=%s)",
+                    position + 1, connection.link.state,
+                )
+                return
+
+            await task
+
+            # Only meaningful once the row is actually live, which the state
+            # machine answers -- not voice.is_playing(), which returns True
+            # on a dead player thread and so cannot be used as a gate.
+            if row.get("muted"):
+                connection.set_muted(True)
 
         except Exception:
             logging.exception("Error restoring profile row %d", position + 1)

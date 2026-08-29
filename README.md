@@ -57,6 +57,88 @@ Queries:
   -C, --channels        Query servers and channels (requires token)
 ```
 
+## Connecting and disconnecting
+
+> ### ⚠️ Behaviour change: picking a channel no longer joins it
+>
+> **In older builds, choosing a channel from the dropdown joined it
+> immediately.** That is gone. Selecting a device, a server and a channel now
+> only *stages* what you want; nothing enters voice until you press
+> **Connect**.
+>
+> If you have used this app before, this is the one thing that will look
+> broken and is not: pick your channel as usual, then press the Connect
+> button that now sits at the end of the row.
+
+Each connection row has its own **Connect** button. It is one button, not
+two: the label is always the next action, and the colour is always the
+current state.
+
+| The row is | The button says | and looks |
+|---|---|---|
+| idle, nothing chosen yet | `Connect`, disabled | grey; the tooltip names what is still missing |
+| idle, ready to go | `Connect` | grey outline, green on hover |
+| joining | `Connecting…`, disabled | amber |
+| **in voice** | `Disconnect` | **solid green — on air** |
+| leaving | `Leaving…`, disabled | amber |
+| the last attempt failed | `Retry` | red outline; the tooltip says why |
+
+Connect is disabled until all three dropdowns are set. Hover it to see which
+of the device, the server and the channel is still missing.
+
+**Disconnect keeps your selections.** Leaving the channel does not clear the
+dropdowns and does not close the audio device, so pressing Connect again
+rejoins the same channel in one click. This is the intended way to hop out of
+voice for a minute.
+
+**While a row is in voice, its server and channel are locked.** Leave first
+if you want to move. The *device* dropdown stays live, so you can still
+switch input mid-broadcast — the stream is re-plugged into the running
+player without dropping the connection.
+
+**While a row is joining or leaving, nothing on it can be pressed.** A join
+cannot be cancelled mid-flight and a second click cannot start a second
+join; discord.py's own 10-second timeout bounds how long the wait can last,
+after which the row lands in `Retry` rather than sitting there forever.
+
+**Rows are independent.** One row failing to join says nothing about any
+other. The status strip shows the most urgent state across all of them: a
+failure outranks everything, and a live row outranks another row that is
+still connecting, so a running stream's health numbers stay on screen.
+
+**Mute** is only available while the row is in voice, and it is now a
+latched button: muted is amber and reads `Resume`, live is indigo and reads
+`Mute`. Disconnecting un-mutes, so the button can never claim a mute that is
+not in effect.
+
+### Under the hood
+
+All of the above is one small state machine per row, in `connection_state.py`
+— no Qt, no discord.py, so its rules are unit-testable on their own:
+
+```
+IDLE ──connect──▶ CONNECTING ──joined──▶ LIVE ──disconnect──▶ DISCONNECTING
+  ▲                    │                   │                       │
+  │                    └── error/timeout ──┴──▶ FAILED             │
+  │                                              │                 │
+  └──── selection changed ───────────────────────┴─────────────────┘
+                                          FAILED ──connect──▶ CONNECTING
+```
+
+Every transition not in that table is *refused* — it returns false and logs,
+it does not raise, because under PyQt6 an exception escaping a slot calls
+`qFatal()` and aborts the process. Disabling the buttons is the first line of
+defence; the machine refusing the request is the second.
+
+The button labels, the button colours, which dropdowns are editable, whether
+mute does anything, what the status strip says, and whether auto-connect may
+fire are all derived from that one value. They used to be four separate
+guesses — `voice is not None`, `voice.is_connected()`, `voice.is_playing()`,
+and the strip's own count of instrumentation samples — which could and did
+disagree. In particular **`is_playing()` is no longer trusted anywhere**: it
+keeps returning true forever once the audio player thread has died, so it
+cannot be used to decide whether anything is actually connected or playing.
+
 ## Live status strip
 
 The bar along the bottom of the window is a health readout for the stream,
@@ -70,11 +152,17 @@ you hear it.
 
 | Field | Meaning |
 |---|---|
-| state word | `Live`, `Degrading`, `Stalled`, `Disconnected`, `Muted`, `Idle`, … |
+| state word | `Idle`, `Connecting`, `Starting`, `Live`, `Degrading`, `Stalled`, `Disconnected`, `Muted`, `Disconnecting`, `Failed` |
 | latency | Voice websocket round-trip reported by discord.py, in ms. |
 | drops | Cumulative input dropouts: PortAudio ring overflows plus empty reads. |
 | drift | Audio frames actually read versus elapsed wall time, in ppm. Positive means the stream is running ahead of the clock, negative means it is falling behind. |
 | uptime | Time since the voice connection was established. |
+
+`Idle`, `Connecting`, `Disconnecting` and `Failed` come straight from the
+connection state machine described above — the strip does not form its own
+opinion about whether the app is in voice, it reads the same value the
+buttons do. The health metrics are only consulted once a row is actually
+live, because only then is there a stream to measure.
 
 The state is written out in words as well as coloured (green healthy, amber
 degrading, red failing), so the strip is readable without relying on colour.
@@ -125,6 +213,11 @@ the app turns that restored selection into an actual voice connection on
 launch, without being asked. Joining is audible to everyone in the channel,
 so it is opt-in.
 
+When it is on, auto-connect presses the Connect button for you: it goes
+through exactly the same code as a click, so it obeys the same rules. An
+incomplete restored row is refused rather than half-joined, and an
+auto-connect that fails leaves that row showing `Retry` instead of hanging.
+
 ## Remembering your last setup
 
 Whenever you change a dropdown, the app records that row's audio device,
@@ -151,6 +244,11 @@ the rest blank, and logs one line saying which part was dropped and why.
 Restoring happens in two phases, because the server list does not exist
 until the bot has finished logging in: devices are restored immediately, and
 servers/channels once the client is ready.
+
+**Restoring is not connecting.** The saved selection is put back into the
+dropdowns and stops there; the app joins voice only if *Auto-connect on
+launch* is ticked. This is the same rule as for a selection you make by
+hand — choosing a channel stages it, pressing Connect joins it.
 
 ## Settings file
 
