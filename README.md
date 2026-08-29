@@ -39,7 +39,8 @@ options:
   -h, --help            show this help message and exit
   -t TOKEN, --token TOKEN
                         The token for the bot
-  -v, --verbose         Enable verbose logging
+  -v, --verbose         Echo logs to the console and enable DEBUG for DAP's
+                        own logger. discord.log is written either way.
   --diagnose            Log verbose audio/voice-state diagnostics every 5s
                         to DAP_session.log. The metrics themselves are
                         always collected and shown in the status strip;
@@ -217,14 +218,96 @@ every slot and asserts none of them logged.
 
 ## Logging and diagnostics
 
-Three log files are written next to `main.pyw`. All three rotate at 2 MB and
-keep 3 backups, so they can no longer grow without bound.
+Three log files are written next to `main.pyw`, **all three unconditionally**.
+All three rotate, so they can no longer grow without bound.
 
-| File | When | Contents |
-|---|---|---|
-| `DAP_errors.log` | always | ERROR and above; unhandled exceptions from the app. |
-| `DAP_session.log` | always | INFO lifecycle trail: start (with versions and redacted args), device selection, channel joins, disconnects, profile restore decisions, shutdown. Also carries a handful of discord.py voice diagnostics promoted from DEBUG to WARNING — most importantly `Aborting playback`, which discord.py emits immediately before it silently abandons the audio player thread. |
-| `discord.log` | `-v` only | Full DEBUG firehose from the `discord` logger. |
+| File | When | Rotation | Contents |
+|---|---|---|---|
+| `DAP_errors.log` | always | 2 MB × 4 | ERROR and above; unhandled exceptions from the app. |
+| `DAP_session.log` | always | 2 MB × 4 | INFO lifecycle trail: start (with versions and redacted args), device selection, channel joins, disconnects, profile restore decisions, and shutdown *with its cause*. Also carries discord.py voice diagnostics promoted from DEBUG to WARNING — most importantly `Aborting playback` — plus the `PLAYER ABORT:` verdict described below. |
+| `discord.log` | always | 4 MB × 5 | Full DEBUG firehose from the `discord` logger: gateway and voice websocket frames, close codes, handshakes, heartbeats, DAVE/MLS transitions. |
+
+### Why `discord.log` is no longer behind `-v`
+
+Upstream wrote this file only with `-v`. A 26-minute user session was
+captured and analysed without the flag, and the capture contained **zero**
+gateway evidence — no voice websocket close codes (4006/4014/4015/4017), no
+`Disconnected from voice`, no handshake or heartbeat trail. Had the stall
+fired during those 26 minutes, nothing would have been learned. Forensic
+logging that exists only when someone remembered a flag is forensic logging
+nobody has when they need it.
+
+The cost was measured, not guessed. A 45-minute real-audio capture is a
+~41 KB connect burst followed by a flat **~5.1 KB/min** steady state
+(38–40 lines a minute, almost all heartbeat pairs) — 306 KB/hour. At 4 MB
+per file the *active* file holds ~13 hours of continuous connection, so an
+ordinary evening session is one contiguous file with no rollover to
+reassemble; 4 backups cap the whole set at 20 MB.
+
+It also **appends rather than truncating**, which upstream's `mode="w"` did
+not. The stall's signature is that audio dies while the app survives, so the
+user's response is to restart — and truncate-on-start would wipe the gateway
+trail of the failed session at exactly that moment.
+
+`-v` is therefore no longer a gate on this file, but it is not a no-op
+either. It echoes the whole log stream to the console (useful for a CLI run
+or a terminal-launched build) and lowers the `dap` namespace to DEBUG, in
+both the logger and the session-log filter.
+
+### `PLAYER ABORT:` — telling a real stall from an ordinary disconnect
+
+Seeing `Aborting playback` on its own proves nothing, because a deliberate
+`disconnect()` reaches the same line in discord.py as the bug does. The
+discriminator is the *gap* between two messages:
+
+```
+if not client.is_connected():
+    _log.debug('Not connected, waiting for %ss...', client.timeout)
+    connected = client.wait_until_connected(client.timeout)   # Event.wait(timeout)
+    if self._end.is_set() or not connected:
+        _log.debug('Aborting playback')
+        return                                                # _end never set
+```
+
+- **Real stall** — nothing ever sets the event, so `Event.wait` returns only
+  when the full timeout expires. Measured: **10.005 s**.
+- **Benign teardown** — `disconnect()` calls `stop()` and then pulses the
+  event (`self._connected.set(); self._connected.clear()`, commented *"Flip
+  the connected event to unlock any waiters"*), releasing the wait at once.
+  Measured: **0.035 s**.
+
+DAP measures that gap and writes an explicit verdict to `DAP_session.log`:
+
+```
+ERROR [dap.player] PLAYER ABORT: 10.002s gap vs timeout=10.0s (100%) -> REAL STALL. …
+INFO  [dap.player] player abort: 0.028s gap vs timeout=10.0s (0%) -> benign teardown. …
+```
+
+The real case is ERROR (so it also lands in `DAP_errors.log`); the benign
+case is INFO, so it does not cry wolf. The timeout is **not hardcoded** — it
+is read from the argument discord.py logged, which is the value it is
+actually about to wait for. The cut sits at half of it: the two populations
+are an `Event.set()` apart versus a full timeout expiry, and nothing lands in
+between, because a reconnect that succeeds partway through logs `Reconnected,
+resuming playback` and never reaches the abort line at all.
+
+### Shutdown cause
+
+The closing line names *why* the app stopped, which the previous
+unconditional `=== DAP shutdown (clean) ===` could not:
+
+```
+=== DAP shutdown (window-close-button) after 1543.2s ===
+=== DAP shutdown (keyboard-interrupt) after 61.4s | exc=KeyboardInterrupt() ===
+=== DAP shutdown (unhandled-exception) after 92.1s | exc=RuntimeError(…) ===
+```
+
+Reasons: `window-closed`, `window-close-button`, `keyboard-interrupt`,
+`asyncio-cancelled`, `discord-client-exit`, `discord-login-failed`,
+`no-token-file`, `error-in-main`, `unhandled-exception`, or `unattributed`
+if the process unwound through a path nobody instrumented — itself a
+finding. The first site to record a cause wins, so the specific trigger (the
+user clicked close) is not overwritten by the generic one that follows it.
 
 Every `DAP_session.log` line carries the writing process's pid
 (`… pid=12345 INFO …`). The file is opened by path in the working
@@ -270,8 +353,14 @@ still end up with the evidence in `DAP_session.log`:
 - `PLAYER PARKED` — the player thread is alive but its loop counter has not
   advanced, i.e. it is blocked, most likely inside the audio device read.
 
-With `--diagnose` a callback is also attached to playback so that the player
-thread logs its own exit, including the case where it exits with no error at
-all. That one stays behind the flag because it changes what gets passed to
-`VoiceClient.play()`, and the status strip does not need it — the voice
-poller already spots a dead player thread within one poll.
+A third ungated probe, `THREAD EXIT`, is attached to playback so the player
+thread logs its own death — including the case where it exits with no error
+at all, which is the silent bare `return` above. This was behind
+`--diagnose` because it changes what gets passed to `VoiceClient.play()`.
+That call was reversed: passing a non-`None` `after` costs exactly one
+`elif` branch in `AudioPlayer._call_after` (upstream's `_log.exception` for
+a failed voice thread), and the callback re-logs that itself with
+`exc_info`, so the traceback still reaches `DAP_errors.log` with more
+context than before. Nothing is lost, and the probe is the only evidence of
+player-thread death that is instantaneous rather than inferred up to five
+seconds later by the poller.

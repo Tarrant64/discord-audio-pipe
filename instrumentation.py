@@ -19,10 +19,14 @@ These are two different things and they are gated separately:
   That flag controls the per-5-second summary lines written to
   ``DAP_session.log``, and nothing else.
 
-The two WARNING conditions (SILENT ABORT, PLAYER PARKED) are deliberately
-*not* behind the flag. They fire at most once per episode, they are the
-whole reason this module exists, and a user who hits the bug without
+The three WARNING conditions -- SILENT ABORT, PLAYER PARKED, and the
+THREAD EXIT callback built by :func:`make_after` -- are deliberately *not*
+behind the flag. They fire at most once per episode, they are the whole
+reason this module exists, and a user who hits the bug without
 ``--diagnose`` should still end up with the evidence in their log.
+``make_after`` was gated until the 26-minute capture that had neither
+``-v`` nor ``--diagnose`` proved the point; its docstring records the
+reasoning and the one behavioural difference, which is compensated for.
 
 What we are hunting
 -------------------
@@ -706,23 +710,51 @@ class VoiceStatePoller:
 
 
 def make_after(label=""):
-    """Build an ``after=`` callback for ``VoiceClient.play()``.
-
-    Returns ``None`` unless ``--diagnose`` is on, so the normal call site
-    collapses to upstream's ``play(source, after=None)`` exactly. This one
-    stays behind the flag on purpose: unlike the passive read/poll probes,
-    it changes what gets handed to ``VoiceClient.play()``, and the status
-    strip does not need it -- :class:`VoiceStatePoller` already detects a
-    dead player thread within one poll interval.
+    """Build an ``after=`` callback for ``VoiceClient.play()``. Always on.
 
     ``AudioPlayer.run`` calls this from a ``finally``, so it fires on
     *every* exit path -- including the bare ``return`` at player.py:819,
-    where ``error`` is None. Right now that death is completely invisible;
-    this makes it announce itself with a wall-clock timestamp and the
-    thread name.
+    where ``error`` is None. That death is otherwise completely invisible:
+    it is the single most direct evidence of player-thread termination, and
+    the only one that is instantaneous rather than inferred.
+
+    Why this stopped being gated on ``--diagnose``
+    ----------------------------------------------
+
+    The earlier call was to keep the connect path byte-identical to upstream
+    unless diagnosing, because unlike the passive read/poll probes this one
+    changes what gets handed to ``VoiceClient.play()``. Reconsidered, and
+    reversed, for three reasons.
+
+    1. **The behavioural delta is one branch, and we cover it.**
+       ``AudioPlayer._call_after`` is::
+
+            if self.after is not None:
+                try: self.after(error)
+                except Exception as exc: _log.exception('Calling the after function failed.', ...)
+            elif error:
+                _log.exception('Exception in voice thread %s', self.name, exc_info=error)
+
+       Passing a non-None ``after`` costs exactly upstream's ``elif``
+       branch. So this callback re-logs the error itself, with ``exc_info``,
+       at ERROR -- the traceback still reaches ``DAP_errors.log``, with
+       strictly more context than upstream's line carried. Nothing is lost.
+
+    2. **The gated version was evidence we would never have.** The 26-minute
+       capture that motivated this hardening pass had neither ``-v`` nor
+       ``--diagnose``. A probe that fires only when someone remembered a
+       flag is not a probe.
+
+    3. **The poller is not a substitute.** ``VoiceStatePoller`` infers a
+       dead thread up to 5 seconds later, and only while the connection
+       object is still around to poll. This fires synchronously, in the
+       dying thread, with its name -- which is what correlates the death
+       against the gateway trail in ``discord.log``.
+
+    Cost is one Python call per player-thread exit, i.e. a handful per
+    session, on a thread that is already finished. It is wrapped so it can
+    never raise inside discord.py's ``finally``.
     """
-    if not VERBOSE:
-        return None
 
     def after(error):
         try:
@@ -738,8 +770,19 @@ def make_after(label=""):
                     "player%s: exited with error=None -- consistent with the"
                     " silent paths: empty source read, or the bare return at"
                     " discord/player.py:819 after a reconnect exceeded"
-                    " client.timeout.",
+                    " client.timeout. Check DAP_session.log for a"
+                    " 'PLAYER ABORT:' verdict line at the same timestamp,"
+                    " which distinguishes the two.",
                     label,
+                )
+            elif isinstance(error, BaseException):
+                # Replaces the _log.exception() in _call_after's elif branch,
+                # which passing a non-None after() skips. Same traceback,
+                # more context, and it lands in DAP_errors.log too.
+                log.error(
+                    "player%s: exited with an exception in the voice thread",
+                    label,
+                    exc_info=error,
                 )
         except Exception:
             # never let instrumentation raise inside discord.py's finally

@@ -39,7 +39,8 @@ parser.add_argument(
     "--verbose",
     dest="verbose",
     action="store_true",
-    help="Enable verbose logging",
+    help="Echo logs to the console and enable DEBUG for DAP's own logger."
+         " discord.log is written either way.",
 )
 
 parser.add_argument(
@@ -88,7 +89,8 @@ query.add_argument(
 args = parser.parse_args()
 is_gui = not any([args.channel, args.device, args.query, args.online])
 
-# verbose logs
+# verbose logs (discord.log is written regardless now; -v adds console
+# echo and lowers the dap namespace to DEBUG -- see logging_setup)
 if args.verbose:
     logging_setup.enable_verbose()
 
@@ -140,7 +142,8 @@ async def main(bot):
 
         await bot.start(token)
 
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        logging_setup.note_shutdown("no-token-file", exc=exc)
         if is_gui:
             msg.setWindowTitle("Token Error")
             msg.setText("No Token Provided")
@@ -149,7 +152,8 @@ async def main(bot):
         else:
             print("No Token Provided")
 
-    except discord.errors.LoginFailure:
+    except discord.errors.LoginFailure as exc:
+        logging_setup.note_shutdown("discord-login-failed", exc=exc)
         if is_gui:
             msg.setWindowTitle("Login Failed")
             msg.setText("Please check if the token is correct")
@@ -158,7 +162,8 @@ async def main(bot):
         else:
             print("Login Failed: Please check if the token is correct")
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        logging_setup.note_shutdown("asyncio-cancelled", exc=exc)
         if is_gui:
             bot_ui.close()
 
@@ -166,14 +171,25 @@ async def main(bot):
         await asyncio.sleep(1)
         raise
 
-    except Exception:
+    except Exception as exc:
+        logging_setup.note_shutdown("error-in-main", exc=exc)
         logging.exception("Error on main")
 
 bot = discord.Client(intents=discord.Intents.default())
 
 try:
     asyncio.run(main(bot))
-except KeyboardInterrupt:
+except KeyboardInterrupt as exc:
+    logging_setup.note_shutdown("keyboard-interrupt", exc=exc)
     print("Exiting...")
+except BaseException as exc:
+    # Attribute it, then let it propagate exactly as before -- the installed
+    # excepthook still writes the traceback to DAP_errors.log.
+    logging_setup.note_shutdown(exc=exc)
+    raise
+else:
+    # asyncio.run() returned without raising, i.e. bot.start() came back.
+    # First-writer-wins means a GUI close already recorded itself here.
+    logging_setup.note_shutdown("discord-client-exit")
 finally:
     logging_setup.log_shutdown()

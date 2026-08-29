@@ -4,23 +4,44 @@ This module owns *all* log handler setup so that upstream files stay
 merge-clean. Nothing in here changes application behaviour -- it only
 changes what gets recorded and where.
 
-Three log files:
+Three log files, **all three always on**:
 
   DAP_errors.log   ERROR and above on the root logger. Upstream behaviour,
                    now size-bounded by a RotatingFileHandler.
-  discord.log      full DEBUG firehose from the ``discord`` logger, only
-                   when ``-v`` / ``--verbose`` is passed. Upstream
-                   behaviour, now size-bounded.
-  DAP_session.log  NEW. INFO-level lifecycle log: start/stop, device
-                   selection, guild/channel joins, connects, disconnects,
-                   settings/profile changes, the ``--diagnose``
-                   instrumentation output, plus the *promoted* discord.py
-                   diagnostics described below. Every line carries the
-                   writing process's pid, because two builds launched from
-                   the same directory share this file.
+  discord.log      full DEBUG firehose from the ``discord`` logger. Upstream
+                   gated this behind ``-v``; we do not. See "Why the gateway
+                   log is unconditional" below.
+  DAP_session.log  NEW. INFO-level lifecycle log: start/stop (with the
+                   *cause* of the stop), device selection, guild/channel
+                   joins, connects, disconnects, settings/profile changes,
+                   the ``--diagnose`` instrumentation output, plus the
+                   *promoted* discord.py diagnostics and the abort verdict
+                   described below. Every line carries the writing process's
+                   pid, because two builds launched from the same directory
+                   share this file.
 
-The promotion filter is the highest-value piece here. discord.py logs its
-two most diagnostic voice lines at DEBUG:
+Why the gateway log is unconditional
+------------------------------------
+
+A 26-minute user session was captured and analysed with ``-v`` absent.
+``discord.log`` was stale, so the capture contained **zero** gateway
+evidence: no voice websocket close codes (4006/4014/4015/4017), no
+``Disconnected from voice``, no handshake or heartbeat trail, no DAVE/MLS
+transitions. If the stall had fired during those 26 minutes we would have
+learned nothing. Forensic logging that only exists when someone remembered
+a flag is forensic logging nobody has when they need it.
+
+Cost was measured, not guessed. A 45-minute real-audio capture from the
+test VM (``vm_healthy_realaudio_discord.log``, 271 221 bytes over 46 wall
+minutes) breaks down as a ~41 KB connect/handshake burst in the first
+minute and then a flat **~5.1 KB/min** steady state -- 38-40 lines a
+minute, almost all voice/gateway heartbeat pairs. That is 306 KB/hour, or
+7.3 MB/day of continuous connection. See :data:`DEBUG_MAX_BYTES`.
+
+The abort discriminator
+-----------------------
+
+discord.py logs its two most diagnostic voice lines at DEBUG:
 
     discord/player.py:814   'Not connected, waiting for %ss...'
     discord/player.py:818   'Aborting playback'
@@ -28,8 +49,12 @@ two most diagnostic voice lines at DEBUG:
 The second sits immediately before a bare ``return`` that leaves
 ``AudioPlayer._end`` unset, so ``VoiceClient.is_playing()`` keeps
 returning True on a dead thread -- the exact silent-stall signature we are
-hunting. Seeing that line once proves the hypothesis outright, so we force
-it into the session log at WARNING regardless of ``-v``.
+hunting. Both are promoted into the session log at WARNING.
+
+But seeing 'Aborting playback' is **not** on its own proof of the bug,
+because a deliberate ``disconnect()`` reaches the same line. The
+discriminator is the *gap* between the two messages -- see
+:class:`AbortDiscriminator`, which turns it into an explicit verdict line.
 """
 
 import logging
@@ -37,6 +62,7 @@ import logging.handlers
 import os
 import sys
 import threading
+import time
 
 # ---------------------------------------------------------------------------
 # file names / rotation policy
@@ -49,17 +75,51 @@ SESSION_LOG = "DAP_session.log"
 MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 BACKUP_COUNT = 3
 
+#: Rotation policy for the now-always-on gateway log, sized from the
+#: measured 5.1 KB/min steady state (see the module docstring).
+#:
+#:   4 MB per file    ~13 hours of continuous connection in the *active*
+#:                    file alone, so an ordinary evening session -- and the
+#:                    15-20 minute stall inside it -- is one contiguous
+#:                    file with no rollover to reassemble.
+#:   4 backups        ~65 hours retained, 20 MB hard ceiling.
+#:
+#: The headroom matters because a stall episode is not the idle case: a
+#: voice reconnect storm logs far faster than 5 KB/min. Even at a 10x burst
+#: rate the active file still holds 80 minutes, which comfortably brackets
+#: the 15-20 minute failure window. 20 MB is a rounding error on any disk
+#: this app runs on, and it buys a capture that cannot silently lose the
+#: minutes before the abort.
+DEBUG_MAX_BYTES = 4 * 1024 * 1024
+DEBUG_BACKUP_COUNT = 4
+
 SESSION_LOGGER_NAME = "dap"
 
 # Substrings of discord.py log messages that we promote to WARNING on the
 # session log. Matched against the raw ``record.msg`` format string (not the
 # interpolated message) so the check is a cheap ``in`` against a constant.
+WAIT_NEEDLE = "Not connected, waiting for"      # player.py:814
+ABORT_NEEDLE = "Aborting playback"              # player.py:818
+RESUME_NEEDLE = "Reconnected, resuming playback"  # player.py:820
+
 PROMOTED_SUBSTRINGS = (
-    "Aborting playback",             # player.py:818  - silent-abort path (c)
-    "Not connected, waiting for",    # player.py:814  - reconnect wait begins
-    "Reconnected, resuming playback",  # player.py:820 - recovery
+    ABORT_NEEDLE,                    # silent-abort path (c)
+    WAIT_NEEDLE,                     # reconnect wait begins
+    RESUME_NEEDLE,                   # recovery
     "A packet has been dropped",     # voice_client.py:608 - UDP send gap
 )
+
+#: ``client.timeout`` to assume when the wait record does not carry it as an
+#: argument. ``gui.py`` passes ``connect(timeout=10)``; the discriminator
+#: prefers the value discord.py actually logged (``record.args[0]``) and only
+#: falls back to this if discord.py changes that call's signature.
+CONNECT_TIMEOUT_FALLBACK = 10.0
+
+#: Fraction of ``client.timeout`` above which an abort is judged a real
+#: stall. See :class:`AbortDiscriminator` for why any value in the wide
+#: empty band between the two populations works, and why half is the one
+#: that needs no maintenance.
+ABORT_REAL_FRACTION = 0.5
 
 # Loggers whose records we inspect for promotion. Their level is forced to
 # DEBUG so the records are emitted at all; the filter drops everything else,
@@ -80,13 +140,22 @@ class SessionFilter(logging.Filter):
       :data:`PROMOTED_SUBSTRINGS` -- passes regardless of level.
 
     Everything else is dropped.
+
+    ``min_level`` is the floor applied to the ``dap`` namespace; ``-v``
+    lowers it to DEBUG so our own debug chatter reaches the session log too.
+    It is deliberately *not* applied to promoted records, which pass at
+    whatever level discord.py logged them.
     """
+
+    def __init__(self, min_level=logging.INFO):
+        super().__init__()
+        self.min_level = min_level
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name == SESSION_LOGGER_NAME or record.name.startswith(
             SESSION_LOGGER_NAME + "."
         ):
-            return record.levelno >= logging.INFO
+            return record.levelno >= self.min_level
 
         msg = record.msg
         if not isinstance(msg, str):
@@ -99,25 +168,234 @@ class SessionFilter(logging.Filter):
         return False
 
 
+class AbortDiscriminator:
+    """Turn 'Aborting playback' into a verdict: real stall, or teardown?
+
+    Why a bare 'Aborting playback' proves nothing
+    ---------------------------------------------
+
+    Both the bug and an ordinary disconnect reach ``player.py:818``::
+
+        if not client.is_connected():
+            _log.debug('Not connected, waiting for %ss...', client.timeout)
+            connected = client.wait_until_connected(client.timeout)
+            if self._end.is_set() or not connected:
+                _log.debug('Aborting playback')
+                return
+
+    ``wait_until_connected`` is ``threading.Event.wait(timeout)``. That is
+    the whole discriminator:
+
+    * **Real stall.** Nothing ever sets the event. ``Event.wait`` returns
+      False only when the full timeout has elapsed, so the two records land
+      ``client.timeout`` apart -- 10.0s with what ``gui.py`` passes today.
+    * **Benign teardown.** ``VoiceClient.disconnect()`` calls ``stop()``
+      (which sets ``_end``) and then ``VoiceConnectionState.disconnect()``,
+      which does::
+
+            # Flip the connected event to unlock any waiters
+            self._connected.set()
+            self._connected.clear()
+
+      That pulse releases ``Event.wait`` immediately, so the two records
+      land *sub-second* apart -- an in-process ``Event.set()`` on an
+      already-waiting thread.
+
+    Choosing the threshold
+    ----------------------
+
+    The timeout is **not** hardcoded. It is read from the wait record's own
+    argument (``_log.debug('Not connected, waiting for %ss...',
+    client.timeout)``), which is the value discord.py is actually about to
+    wait for -- strictly better than reading ``gui.py``'s ``timeout=10``
+    literal, and automatically correct if that literal ever changes or if a
+    ``move_to`` uses a different one.
+
+    The cut sits at :data:`ABORT_REAL_FRACTION` (half) of that timeout.
+    Half is not tuning; it is the midpoint of an empty band. The two
+    populations are an ``Event.set()`` away (microseconds to a few tens of
+    milliseconds, dominated by GIL handoff) and a full timeout expiry
+    (10s). Nothing produces a value in between: the one path that *would*
+    -- a reconnect that succeeds partway through the wait -- logs
+    'Reconnected, resuming playback' instead and never reaches the abort
+    line at all. So any threshold in roughly (0.2s, timeout) classifies
+    identically, and half is the choice that stays correct without
+    maintenance for any timeout discord.py hands us.
+
+    Robustness
+    ----------
+
+    Keyed by ``record.thread``, so two connection rows aborting on their own
+    player threads never cross-talk. An abort with no pending wait, a wait
+    with no abort, a resume that cancels a pending wait, and repeated
+    wait/abort cycles across reconnects are all handled -- the unmatched
+    cases produce an explicit UNKNOWN verdict rather than a wrong one, and
+    the pending map is bounded so a leak cannot grow it.
+    """
+
+    #: Hard cap on the pending map. A pending entry exists only between a
+    #: wait and its abort/resume on one player thread, so the real ceiling
+    #: is the number of connection rows. This only bounds a pathological
+    #: leak (e.g. discord.py stops logging the abort line entirely).
+    MAX_PENDING = 64
+
+    def __init__(self, fraction=ABORT_REAL_FRACTION, clock=None,
+                 logger_name=SESSION_LOGGER_NAME + ".player"):
+        self.fraction = fraction
+        #: Monotonic by design: a wall-clock step (NTP, DST, VM resume) mid
+        #: wait must not be able to manufacture or erase a 10-second gap.
+        self.clock = clock if clock is not None else time.monotonic
+        self.logger_name = logger_name
+        self._pending = {}
+        self._lock = threading.Lock()
+
+    # -- pure classification; no logging, fully unit-testable ---------------
+
+    def observe(self, record):
+        """Feed one discord.py record in; get a verdict out, or ``None``.
+
+        :returns: ``None``, or ``(levelno, msg, args)`` ready to hand to
+            ``Logger.log``.
+        """
+        msg = record.msg
+        if not isinstance(msg, str):
+            return None
+
+        key = getattr(record, "thread", None)
+
+        if WAIT_NEEDLE in msg:
+            timeout = CONNECT_TIMEOUT_FALLBACK
+            args = getattr(record, "args", None)
+            if isinstance(args, tuple) and args:
+                try:
+                    candidate = float(args[0])
+                except (TypeError, ValueError):
+                    candidate = 0.0
+                if candidate > 0:
+                    timeout = candidate
+
+            with self._lock:
+                if len(self._pending) >= self.MAX_PENDING:
+                    self._pending.clear()
+                # A second wait without an intervening abort simply
+                # restarts the clock: only the most recent wait can be the
+                # one this thread is sitting in.
+                self._pending[key] = (self.clock(), timeout)
+            return None
+
+        if RESUME_NEEDLE in msg:
+            # Reconnect succeeded. There is no abort coming for this wait.
+            with self._lock:
+                self._pending.pop(key, None)
+            return None
+
+        if ABORT_NEEDLE not in msg:
+            return None
+
+        with self._lock:
+            entry = self._pending.pop(key, None)
+
+        if entry is None:
+            return (
+                logging.WARNING,
+                "PLAYER ABORT: no preceding %r record on thread %s -- cannot"
+                " tell a real stall from a teardown. discord.py's player"
+                " logging may have changed; check discord/player.py.",
+                (WAIT_NEEDLE, key),
+            )
+
+        started, timeout = entry
+        gap = self.clock() - started
+        if gap < 0:
+            gap = 0.0
+        pct = (gap / timeout * 100.0) if timeout > 0 else 0.0
+
+        if gap >= self.fraction * timeout:
+            return (
+                logging.ERROR,
+                "PLAYER ABORT: %.3fs gap vs timeout=%.1fs (%.0f%%) -> REAL"
+                " STALL. discord.py waited out the entire reconnect timeout"
+                " and gave up at discord/player.py:818. That bare return"
+                " never sets AudioPlayer._end, so VoiceClient.is_playing()"
+                " stays True on a dead player thread: audio is gone and"
+                " discord.py will not notice. thread=%s",
+                (gap, timeout, pct, key),
+            )
+
+        return (
+            logging.INFO,
+            "player abort: %.3fs gap vs timeout=%.1fs (%.0f%%) -> benign"
+            " teardown. The connected event was pulsed immediately"
+            " (VoiceConnectionState.disconnect: 'Flip the connected event to"
+            " unlock any waiters'), so this abort followed a deliberate"
+            " stop/disconnect, not a failed reconnect. thread=%s",
+            (gap, timeout, pct, key),
+        )
+
+    # -- side-effecting wrapper --------------------------------------------
+
+    def note(self, record):
+        """:meth:`observe` the record and emit any verdict. Never raises."""
+        try:
+            verdict = self.observe(record)
+        except Exception:
+            return None
+
+        if verdict is None:
+            return None
+
+        level, msg, args = verdict
+        try:
+            logging.getLogger(self.logger_name).log(level, msg, *args)
+        except Exception:
+            pass
+        return verdict
+
+
 class PromotingHandler(logging.handlers.RotatingFileHandler):
     """Rotating handler that re-badges promoted discord.py records at WARNING.
 
-    The re-badge happens on a *copy* of the record, so the ``-v``
-    ``discord.log`` handler (which is offered the same record object further
-    up the logger hierarchy) still sees the original DEBUG level. Mutating the
-    shared record in place would silently corrupt discord.log.
+    The re-badge happens on a *copy* of the record, so the ``discord.log``
+    handler (which is offered the same record object further up the logger
+    hierarchy) still sees the original DEBUG level. Mutating the shared
+    record in place would silently corrupt discord.log.
+
+    This is also where :class:`AbortDiscriminator` is fed. Doing it in
+    ``emit`` rather than in a filter means the verdict is emitted *after*
+    the record that triggered it, so the session log reads in causal order.
     """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.abort = AbortDiscriminator()
+        # The verdict is logged from inside emit(), which re-enters this
+        # handler through the dap logger. That is safe -- the verdict text
+        # matches none of the needles, so it terminates -- but the guard
+        # makes termination structural rather than a property of the
+        # wording, which is the sort of thing a later edit breaks silently.
+        self._local = threading.local()
 
     def emit(self, record):
         own = record.name == SESSION_LOGGER_NAME or record.name.startswith(
             SESSION_LOGGER_NAME + "."
         )
+
         if not own and record.levelno < logging.WARNING:
             record = logging.makeLogRecord(record.__dict__)
             record.levelno = logging.WARNING
             record.levelname = "WARNING"
             record.dap_promoted = True
+
         super().emit(record)
+
+        if own or getattr(self._local, "busy", False):
+            return
+
+        self._local.busy = True
+        try:
+            self.abort.note(record)
+        finally:
+            self._local.busy = False
 
 
 def get_logger():
@@ -125,17 +403,20 @@ def get_logger():
     return logging.getLogger(SESSION_LOGGER_NAME)
 
 
-def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None):
+def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None,
+              debug_max_bytes=None, debug_backup_count=None):
     """Install every handler. Idempotent for normal (``log_dir is None``) use.
 
-    :param verbose: mirrors upstream ``-v``; enables the full DEBUG
-        ``discord.log`` firehose.
+    :param verbose: mirrors upstream ``-v``. No longer gates ``discord.log``
+        -- see :func:`enable_verbose` for what it does now.
     :param log_dir: write logs here instead of the CWD (tests only).
     :param max_bytes: rotation threshold override (tests only).
     :param backup_count: rotation backup count override (tests only).
+    :param debug_max_bytes: ``discord.log`` rotation override (tests only).
+    :param debug_backup_count: ``discord.log`` backups override (tests only).
     :returns: the ``dap`` session logger.
     """
-    global _configured
+    global _configured, _session_filter
 
     with _lock:
         if _configured and log_dir is None:
@@ -186,7 +467,8 @@ def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None):
         )
         session_handler.setLevel(logging.DEBUG)  # gating is done by the filter
         session_handler.setFormatter(session_formatter)
-        session_handler.addFilter(SessionFilter())
+        _session_filter = SessionFilter()
+        session_handler.addFilter(_session_filter)
 
         session_logger = get_logger()
         session_logger.setLevel(logging.INFO)
@@ -198,9 +480,19 @@ def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None):
             lg.setLevel(logging.DEBUG)
             lg.addHandler(session_handler)
 
-        # -- discord.log (upstream -v behaviour, now rotating) --------------
+        # -- discord.log (ALWAYS ON now, and rotating) ----------------------
+        # Upstream hid this behind -v. See the module docstring: a stall
+        # capture without gateway evidence is not a capture. ~5.1 KB/min,
+        # 20 MB ceiling.
+        install_gateway_log(
+            path(DEBUG_LOG),
+            debug_max_bytes,
+            debug_backup_count,
+            force=log_dir is not None,
+        )
+
         if verbose:
-            enable_verbose(path(DEBUG_LOG), maxb, backups)
+            enable_verbose()
 
         _configured = True
 
@@ -284,30 +576,45 @@ def install_excepthook():
 
 
 _verbose_enabled = False
+_gateway_installed = False
+_session_filter = None
 
 
-def enable_verbose(filename=None, max_bytes=None, backup_count=None):
-    """Upstream's ``-v`` behaviour: full DEBUG firehose to ``discord.log``.
+def install_gateway_log(filename=None, max_bytes=None, backup_count=None,
+                        force=False):
+    """Attach the always-on DEBUG firehose handler to the ``discord`` logger.
 
-    Split out from :func:`configure` because ``main.pyw`` installs the error
-    handler before argument parsing (so that import-time failures are still
-    captured) and only learns about ``-v`` afterwards.
+    Two deliberate departures from upstream:
+
+    **Always installed, not just under ``-v``.** Rationale and measured cost
+    are in the module docstring.
+
+    **Appends; does not truncate.** Upstream opened this ``mode="w"``, which
+    was defensible when the file only existed because you asked for it. Now
+    that it is always on, truncating would destroy exactly the evidence we
+    are collecting: the stall's signature is that audio dies while the app
+    survives, so the user's response is to restart the app -- and a
+    truncate-on-start handler would wipe the gateway trail of the failed
+    session the moment they did. Append keeps it. Bounding is
+    :class:`~logging.handlers.RotatingFileHandler`'s job, not truncation's,
+    and a banner line marks each session boundary so multiple runs stay
+    separable in one file.
     """
-    global _verbose_enabled
-    if _verbose_enabled:
-        return
+    global _gateway_installed
+    if _gateway_installed and not force:
+        return None
 
     debug_formatter = logging.Formatter(
         fmt="%(asctime)s:%(levelname)s:%(name)s: %(message)s"
     )
-    # Upstream used mode="w"; RotatingFileHandler honours mode on the initial
-    # open, so verbose runs still start from a clean file.
     debug_handler = logging.handlers.RotatingFileHandler(
         DEBUG_LOG if filename is None else filename,
-        maxBytes=MAX_BYTES if max_bytes is None else max_bytes,
-        backupCount=BACKUP_COUNT if backup_count is None else backup_count,
+        maxBytes=DEBUG_MAX_BYTES if max_bytes is None else max_bytes,
+        backupCount=(
+            DEBUG_BACKUP_COUNT if backup_count is None else backup_count
+        ),
         encoding="utf-8",
-        mode="w",
+        mode="a",
     )
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(debug_formatter)
@@ -315,6 +622,71 @@ def enable_verbose(filename=None, max_bytes=None, backup_count=None):
     debug_logger = logging.getLogger("discord")
     debug_logger.setLevel(logging.DEBUG)
     debug_logger.addHandler(debug_handler)
+
+    # Session banner. Emitted straight at the handler rather than through a
+    # logger, so it cannot be affected by anyone's level or propagation and
+    # cannot leak into the other two files.
+    try:
+        debug_handler.emit(
+            logging.makeLogRecord(
+                {
+                    "name": "dap.gateway",
+                    "levelno": logging.INFO,
+                    "levelname": "INFO",
+                    "msg": "=== gateway log opened | pid=%d | cwd=%s ===",
+                    "args": (os.getpid(), os.getcwd()),
+                }
+            )
+        )
+    except Exception:
+        pass
+
+    _gateway_installed = True
+    return debug_handler
+
+
+def enable_verbose(*_a, **_kw):
+    """``-v`` / ``--verbose``. **No longer gates ``discord.log``.**
+
+    ``discord.log`` is now written on every run (see
+    :func:`install_gateway_log`), so the flag would have been a no-op if
+    left as it was. It is not; it still does two things, both of which are
+    about watching a run rather than capturing one:
+
+    1. **Echoes everything to the console** -- the ``discord`` firehose and
+       our own ``dap`` lines -- so a CLI run or a build launched from a
+       terminal shows the gateway trail live instead of only in a file.
+       Skipped when there is no usable stderr, which is the normal case for
+       a ``pythonw``-launched GUI.
+    2. **Lowers the ``dap`` namespace to DEBUG**, in the logger *and* in the
+       session-log filter, so DEBUG-level diagnostics we write reach
+       ``DAP_session.log``. Without both halves the flag would raise the
+       logger only for records the filter then dropped.
+
+    Positional arguments are accepted and ignored for compatibility with the
+    old ``enable_verbose(filename, max_bytes, backup_count)`` signature.
+    """
+    global _verbose_enabled
+    if _verbose_enabled:
+        return
+
+    session_logger = get_logger()
+    session_logger.setLevel(logging.DEBUG)
+    if _session_filter is not None:
+        _session_filter.min_level = logging.DEBUG
+
+    stream = getattr(sys, "stderr", None)
+    if stream is not None:
+        try:
+            console = logging.StreamHandler(stream)
+            console.setLevel(logging.DEBUG)
+            console.setFormatter(
+                logging.Formatter(fmt="%(levelname)s:%(name)s: %(message)s")
+            )
+            logging.getLogger("discord").addHandler(console)
+            session_logger.addHandler(console)
+        except Exception:
+            pass
 
     _verbose_enabled = True
 
@@ -394,5 +766,111 @@ def log_warn(fmt, *a):
     get_logger().warning(fmt, *a)
 
 
-def log_shutdown(reason="clean"):
-    get_logger().info("=== DAP shutdown (%s) ===", reason)
+# ---------------------------------------------------------------------------
+# shutdown attribution
+# ---------------------------------------------------------------------------
+#
+# Upstream's ``finally: log_shutdown()`` wrote "=== DAP shutdown (clean) ==="
+# for every exit, which meant the log could not answer the first question
+# asked of it after a bad session: did the app stop because the user closed
+# it, or because the thing we are hunting killed it? Those need different
+# investigations and the log conflated them.
+#
+# The cause is only knowable where it happens, so call sites record it and
+# the ``finally`` reports whatever was recorded.
+
+_start_monotonic = time.monotonic()
+_shutdown_reason = None
+_shutdown_detail = None
+
+#: Exception types mapped to a stable reason string, so the log is greppable
+#: rather than needing the reader to know Python's exception hierarchy.
+_EXC_REASONS = {
+    "KeyboardInterrupt": "keyboard-interrupt",
+    "CancelledError": "asyncio-cancelled",
+    "SystemExit": "sys-exit",
+    "ConnectionClosed": "discord-connection-closed",
+    "LoginFailure": "discord-login-failed",
+    "FileNotFoundError": "no-token-file",
+}
+
+
+def note_shutdown(reason=None, exc=None, force=False):
+    """Record *why* the app is stopping. First writer wins. Never raises.
+
+    First-writer-wins is the point: the outermost handler always sees
+    something generic (``asyncio.run`` returned, a CancelledError arrived),
+    while the innermost site knows the actual trigger -- the user clicked
+    the close button. Letting a later, vaguer caller overwrite an earlier,
+    specific one would throw away the only useful part.
+
+    :param reason: short stable slug. Derived from ``exc`` when omitted.
+    :param exc: the exception that triggered the shutdown, if any. Its type
+        name and ``str()`` go into the detail field.
+    :param force: overwrite an already-recorded reason.
+    """
+    global _shutdown_reason, _shutdown_detail
+
+    try:
+        exc_name = type(exc).__name__ if exc is not None else None
+
+        if reason is None:
+            reason = _EXC_REASONS.get(exc_name, "unhandled-exception"
+                                      if exc is not None else "unknown")
+
+        detail = None
+        if exc is not None:
+            text = ""
+            try:
+                text = str(exc)
+            except Exception:
+                text = "<unprintable>"
+            detail = "exc=%s(%s)" % (exc_name, text[:200])
+
+        with _lock:
+            if _shutdown_reason is not None and not force:
+                return
+            _shutdown_reason = str(reason)
+            _shutdown_detail = detail
+    except Exception:
+        # A shutdown path that can itself raise is worse than no attribution.
+        pass
+
+
+def shutdown_reason():
+    """The recorded reason, or ``None``. Test/introspection helper."""
+    with _lock:
+        return _shutdown_reason
+
+
+def reset_shutdown_reason():
+    """Test helper: forget the recorded cause."""
+    global _shutdown_reason, _shutdown_detail
+    with _lock:
+        _shutdown_reason = None
+        _shutdown_detail = None
+
+
+def log_shutdown(reason=None):
+    """Write the closing line, naming the cause. Never raises.
+
+    ``reason=None`` (the normal ``finally`` call) reports whatever
+    :func:`note_shutdown` recorded, or ``unattributed`` if nothing did --
+    which is itself a finding worth seeing, because it means the process
+    unwound through a path nobody instrumented.
+    """
+    try:
+        with _lock:
+            recorded, detail = _shutdown_reason, _shutdown_detail
+
+        if reason is None:
+            reason = recorded if recorded is not None else "unattributed"
+
+        get_logger().info(
+            "=== DAP shutdown (%s) after %.1fs%s ===",
+            reason,
+            time.monotonic() - _start_monotonic,
+            " | " + detail if detail else "",
+        )
+    except Exception:
+        pass

@@ -957,6 +957,9 @@ class TitleBar(QFrame):
 
     @guarded_slot
     def on_close_clicked(self, *_):
+        # Attribute the shutdown at the only place that knows the user asked
+        # for it. First-writer-wins, so this beats the generic outer cause.
+        logging_setup.note_shutdown("window-close-button")
         # Same guard as Connection's async slots: create_task() raises
         # RuntimeError with no running loop, and under PyQt6 that would
         # abort the process instead of just failing to close the window.
@@ -1460,6 +1463,10 @@ class GUI(QMainWindow):
 
     @guarded_slot
     def closeEvent(self, event):
+        # Covers the paths the title-bar button does not: OS window-manager
+        # close, Cmd-Q, app quit. note_shutdown never raises, so it is safe
+        # inside a slot even before @guarded_slot gets a say.
+        logging_setup.note_shutdown("window-closed")
         # A change made in the last few hundred milliseconds still has its
         # save sitting in the debounce timer. Land it before the process goes
         # away, or the setting the user just picked is the one thing the
