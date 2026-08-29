@@ -39,7 +39,9 @@ parser.add_argument(
     "--diagnose",
     dest="diagnose",
     action="store_true",
-    help="Enable audio/voice-state diagnostics (see DAP_session.log)",
+    help="Log verbose audio/voice-state diagnostics every 5s to"
+         " DAP_session.log. The metrics themselves are always collected and"
+         " shown in the status strip; this only controls the logging.",
 )
 
 connect.add_argument(

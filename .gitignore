@@ -1,5 +1,6 @@
 __pycache__/
 token.txt
+DAP_config.json
 *.exe
 *.log
 *.dll

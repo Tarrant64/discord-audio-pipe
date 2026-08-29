@@ -15,6 +15,8 @@
      accent (mute)     #5561E8   hover #5C68EE   pressed #4550D4
      add / success     #43B581
      danger (close)    #D83C3E
+     status healthy    #43B581   degrading #E9A23C   failing #F87171
+     status idle       #9AA0A6
 
    Contrast (WCAG 2.1, computed):
      #E8EAED on #24262C panel ....... 12.6:1
@@ -26,6 +28,17 @@
      #43B581 add glyph on control .... 5.7:1
      #6B76F0 focus ring vs control ... 4.4:1  (non-text, needs 3:1)
      arrow #6B6D72 vs control ........ 3.3:1  (non-text, needs 3:1)
+
+   Status strip, all on the #1B1D21 well:
+     #43B581 healthy ................. 6.6:1
+     #E9A23C degrading ............... 7.8:1
+     #F87171 failing ................. 6.1:1
+     #9AA0A6 idle / metric text ...... 6.4:1
+
+   The strip's failing colour is #F87171, not the #D83C3E used for the close
+   button: #D83C3E is only 3.7:1 as text on #1B1D21, which is fine for a
+   button fill behind white text but not for coloured text. Status is always
+   spelled out in words as well, so colour is never the only channel.
 
    Qt Style Sheets support no transitions, shadows, transforms or variables —
    depth is done with flat layered surfaces and hairline borders only.
@@ -436,6 +449,112 @@ QSvgWidget {
     border: none;
     max-width: 18px;
     max-height: 18px;
+}
+
+
+/* --- live status strip --------------------------------------------------- */
+
+/* Sits in the same "well" surface as the inputs so it reads as instrument
+   panel rather than as another control. */
+QFrame#status {
+    background-color: #1B1D21;
+    border: 1px solid #2A2D33;
+    border-radius: 8px;
+}
+
+/* The generic QLabel rule adds an 8px bottom pad for the column headers;
+   inside the strip that would knock the baseline off centre. */
+QFrame#status QLabel {
+    background-color: transparent;
+    border: none;
+    padding: 0px;
+}
+
+QLabel#status_dot {
+    font-size: 13pt;
+    color: #9AA0A6;
+    padding: 0px 1px 2px 0px;
+}
+
+QLabel#status_state {
+    font-size: 10pt;
+    color: #9AA0A6;
+}
+
+QLabel#status_detail {
+    font-size: 10pt;
+    color: #9AA0A6;
+}
+
+/* State colouring. These selector values are the STATE_* constants in
+   gui.py; the state word is also written out in the label text, so colour
+   is reinforcement and never the only signal. */
+QLabel#status_dot[state="ok"],
+QLabel#status_state[state="ok"] {
+    color: #43B581;
+}
+
+QLabel#status_dot[state="warn"],
+QLabel#status_state[state="warn"] {
+    color: #E9A23C;
+}
+
+QLabel#status_dot[state="fail"],
+QLabel#status_state[state="fail"] {
+    color: #F87171;
+}
+
+QLabel#status_dot[state="idle"],
+QLabel#status_state[state="idle"] {
+    color: #9AA0A6;
+}
+
+
+/* --- auto-recover checkbox ----------------------------------------------- */
+
+QCheckBox#autorecover {
+    background-color: transparent;
+    color: #9AA0A6;
+    font-size: 10pt;
+    spacing: 7px;
+    padding: 0px;
+    outline: none;
+}
+
+QCheckBox#autorecover:hover {
+    color: #E8EAED;
+}
+
+QCheckBox#autorecover::indicator {
+    background-color: #24262C;
+    border: 1px solid #4E545F;
+    border-radius: 4px;
+    width: 14px;
+    height: 14px;
+}
+
+QCheckBox#autorecover::indicator:hover {
+    border-color: #6B76F0;
+}
+
+/* No image: the checked state is a filled accent square. An SVG tick would
+   need a second asset and would not recolour with the theme. */
+QCheckBox#autorecover::indicator:checked {
+    background-color: #5561E8;
+    border-color: #5561E8;
+}
+
+QCheckBox#autorecover::indicator:checked:hover {
+    background-color: #5C68EE;
+    border-color: #6B76F0;
+}
+
+QCheckBox#autorecover:focus {
+    color: #E8EAED;
+}
+
+QCheckBox#autorecover:focus::indicator {
+    border-color: #6B76F0;
 }
 
 

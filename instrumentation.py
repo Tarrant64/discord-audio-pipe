@@ -1,8 +1,28 @@
 """Diagnostic probes for the DAP silent-audio-stall bug.
 
-Enabled only by ``--diagnose``. Observation only -- nothing in here
-attempts to fix, restart, reconnect or work around the stall. If it ever
-starts doing that, it stops being evidence.
+Observation only -- nothing in here attempts to fix, restart, reconnect or
+work around the stall. If it ever starts doing that, it stops being
+evidence.
+
+Collection vs. logging
+----------------------
+
+These are two different things and they are gated separately:
+
+* **Collection is always on.** The measured ``read()`` and the voice-state
+  poller run on every session, because the GUI status strip needs live
+  numbers all the time -- a health readout that only works when you
+  remember to pass a flag is a health readout nobody has when they need it.
+  Measured cost is 0.22 us per ``read()`` against a 20 000 us budget
+  (0.001%), on CPython 3.14 against a fake PortAudio stream.
+* **Verbose logging is on only with ``--diagnose``** (:data:`VERBOSE`).
+  That flag controls the per-5-second summary lines written to
+  ``DAP_session.log``, and nothing else.
+
+The two WARNING conditions (SILENT ABORT, PLAYER PARKED) are deliberately
+*not* behind the flag. They fire at most once per episode, they are the
+whole reason this module exists, and a user who hits the bug without
+``--diagnose`` should still end up with the evidence in their log.
 
 What we are hunting
 -------------------
@@ -35,8 +55,16 @@ Performance contract
 override here does, per call: two ``perf_counter()`` calls, one
 ``read_available`` property read, and a fixed set of int/float attribute
 updates. No allocations beyond upstream's own ``bytes(buf)``, no
-formatting, no logging, no locks, no collections. One summary line is
-emitted per ~250 calls (5 s), guarded by a single float comparison.
+formatting, no logging, no locks, no collections.
+
+Two guarded bodies hang off single float comparisons: one snapshot dict
+built per ~50 calls (1 s) for the status strip, and one summary line
+emitted per ~250 calls (5 s) when ``--diagnose`` is on.
+
+Measured against a fake PortAudio stream on CPython 3.14: 122 ns/call for
+``sound.PCMStream.read``, 344 ns/call for this override -- 222 ns of
+overhead, 0.001% of the 20 ms budget per frame. Turning ``--diagnose`` on
+moves that to 223 ns, i.e. the log line does not register.
 
 Private-attribute safety
 ------------------------
@@ -55,20 +83,21 @@ import sound
 import logging_setup
 
 SAMPLE_RATE = 48000
-SUMMARY_INTERVAL = 5.0  # seconds
+SUMMARY_INTERVAL = 5.0  # cadence of the verbose diagnostic log lines
+PUBLISH_INTERVAL = 1.0  # cadence of the live snapshot the status strip reads
 
 log = logging.getLogger("dap.diag")
 
-# Set by ``main.pyw`` when ``--diagnose`` is passed. Defaults OFF: with this
-# False every helper below is a no-op returning exactly what upstream would
-# have used (a plain PCMStream, ``after=None``, no poller).
-ENABLED = False
+# Set by ``main.pyw`` when ``--diagnose`` is passed. Gates *logging verbosity
+# only* -- metric collection runs regardless. See the module docstring.
+VERBOSE = False
 
 
 def enable():
-    global ENABLED
-    ENABLED = True
-    log.info("diagnostics enabled (--diagnose)")
+    """Turn on the per-5s diagnostic log lines (``--diagnose``)."""
+    global VERBOSE
+    VERBOSE = True
+    log.info("verbose diagnostics enabled (--diagnose)")
 
 # ---------------------------------------------------------------------------
 # defensive private-attribute access
@@ -108,6 +137,143 @@ def reset_probes():
         _dead_probes.clear()
 
 
+def dead_probes():
+    """Names of probes retired this run. Read-only copy."""
+    with _dead_lock:
+        return frozenset(_dead_probes)
+
+
+# ---------------------------------------------------------------------------
+# live metric snapshot
+# ---------------------------------------------------------------------------
+#
+# Threading model, because getting this wrong is how you turn a health
+# readout into the thing that breaks audio:
+#
+#   * ``InstrumentedPCMStream.read()`` runs on discord.py's player thread.
+#     Once per second it *builds a fresh dict* and rebinds one attribute
+#     (``self.published``). It never takes a lock, never blocks, never
+#     touches Qt.
+#   * ``VoiceStatePoller.poll_once()`` runs on the asyncio event loop and
+#     does the same to its own ``published``.
+#   * The Qt status strip calls :func:`snapshot`, which copies two short
+#     lists and reads those already-built dicts.
+#
+# A single attribute rebind is atomic under the GIL, so the reader either
+# sees the previous complete dict or the next complete dict -- never a
+# half-populated one. No lock is needed on the hot path, which is the whole
+# point: the audio thread must never wait on the GUI.
+
+_streams = []   # every InstrumentedPCMStream created (one per connection row)
+_pollers = []   # VoiceStatePollers currently attached
+_registry_lock = threading.Lock()
+
+
+def _register_stream(stream):
+    with _registry_lock:
+        _streams.append(stream)
+
+
+def _register_poller(poller):
+    with _registry_lock:
+        _pollers.append(poller)
+
+
+def _unregister_poller(poller):
+    with _registry_lock:
+        try:
+            _pollers.remove(poller)
+        except ValueError:
+            pass
+
+
+def reset_registry():
+    """Test helper: forget every registered stream and poller."""
+    with _registry_lock:
+        _streams.clear()
+        _pollers.clear()
+
+
+def _worst(values, key=None):
+    """Max of the non-None values, or None if there are none."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return None
+    return max(vals, key=key) if key else max(vals)
+
+
+def snapshot():
+    """Aggregate every active stream and voice connection into one dict.
+
+    Safe to call from the Qt thread at any cadence; it allocates a couple of
+    small lists and does no I/O, no formatting and no probing.
+
+    Every numeric field is ``None`` when it is genuinely unknown -- no
+    connection yet, or the underlying probe has been retired because
+    discord.py moved its internals. Callers must render ``None`` as "--"
+    and must never substitute a previous value, because a stale number
+    presented as live is worse than no number at all.
+    """
+    now = time.perf_counter()
+
+    with _registry_lock:
+        streams = list(_streams)
+        pollers = list(_pollers)
+
+    audio = [s.published for s in streams if s.published is not None]
+    voice = [p.published for p in pollers if p.published is not None]
+
+    out = {
+        "now": now,
+        "connections": len(pollers),
+        "voice_samples": len(voice),
+        "audio_samples": len(audio),
+        "connected": None,
+        "playing": None,
+        "paused": None,
+        "stalled": False,
+        "parked": False,
+        "latency_ms": None,
+        "avg_latency_ms": None,
+        "uptime_s": None,
+        "voice_age_s": None,
+        "drops": None,
+        "drift_ppm": None,
+        "drift_s": None,
+        "read_ms_max": None,
+        "read_ms_mean": None,
+        "reads": None,
+        "ring": None,
+        "audio_age_s": None,
+        "dead_probes": dead_probes(),
+    }
+
+    if voice:
+        # "Worst wins" across rows: a health strip that shows the healthy
+        # connection while another one is dead is actively misleading.
+        out["connected"] = all(v["connected"] is True for v in voice)
+        out["playing"] = all(v["playing"] is True for v in voice)
+        out["paused"] = any(v["paused"] is True for v in voice)
+        out["stalled"] = any(v["stalled"] for v in voice)
+        out["parked"] = any(v["parked"] for v in voice)
+        out["latency_ms"] = _worst(v["latency_ms"] for v in voice)
+        out["avg_latency_ms"] = _worst(v["avg_latency_ms"] for v in voice)
+        out["uptime_s"] = now - min(v["since"] for v in voice)
+        out["voice_age_s"] = now - min(v["t"] for v in voice)
+
+    if audio:
+        out["drops"] = sum(a["drops"] for a in audio)
+        out["reads"] = sum(a["reads"] for a in audio)
+        out["drift_ppm"] = _worst((a["drift_ppm"] for a in audio), key=abs)
+        out["drift_s"] = _worst((a["drift_s"] for a in audio), key=abs)
+        out["read_ms_max"] = _worst(a["read_ms_max"] for a in audio)
+        out["read_ms_mean"] = _worst(a["read_ms_mean"] for a in audio)
+        out["ring"] = _worst(a["ring"] for a in audio)
+        out["audio_age_s"] = now - min(a["t"] for a in audio)
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # audio-thread instrumentation
 # ---------------------------------------------------------------------------
@@ -122,7 +288,8 @@ class InstrumentedPCMStream(sound.PCMStream):
     instead of thrown away.
     """
 
-    def __init__(self, interval=SUMMARY_INTERVAL, logger=None):
+    def __init__(self, interval=SUMMARY_INTERVAL, logger=None,
+                 publish_interval=PUBLISH_INTERVAL):
         super().__init__()
 
         self._log = logger if logger is not None else log
@@ -144,6 +311,13 @@ class InstrumentedPCMStream(sound.PCMStream):
         self._ring_ok = True
         self._ring_last = -1
         self._ring_max = -1
+
+        # live snapshot for the GUI status strip. Rebound wholesale, never
+        # mutated in place -- see the threading note above.
+        self.published = None
+        self._pub_interval = publish_interval
+        self._pub_next = time.perf_counter() + publish_interval
+        self._pub_max = 0.0
 
     def _reset_window(self, now):
         self._w_start = now
@@ -168,6 +342,8 @@ class InstrumentedPCMStream(sound.PCMStream):
         self._w_sum += dt
         if dt > self._w_max:
             self._w_max = dt
+        if dt > self._pub_max:
+            self._pub_max = dt
         if overflowed:
             self._w_over += 1
             self._overflow_total += 1
@@ -196,11 +372,54 @@ class InstrumentedPCMStream(sound.PCMStream):
         if self._wall_start is None:
             self._wall_start = t0
 
-        # one float compare per call; the body runs ~once per 250 calls
+        # two float compares per call; the bodies run ~once per 50 and ~once
+        # per 250 calls respectively
+        if t1 >= self._pub_next:
+            self._publish(t1)
         if t1 - self._w_start >= self._interval:
             self._emit(t1)
 
         return data
+
+    # -- 1 s live snapshot --------------------------------------------------
+
+    def _publish(self, now):
+        """Rebind ``self.published`` to a freshly built dict.
+
+        Runs on the player thread. One dict allocation per second, no
+        formatting, no locks, no logging.
+        """
+        audio_seconds = self._frames_total / SAMPLE_RATE
+        wall_seconds = now - self._wall_start if self._wall_start else 0.0
+        divergence = audio_seconds - wall_seconds
+
+        self.published = {
+            "t": now,
+            "reads": self._reads_total,
+            # "drops" is the honest input-side dropout count: PortAudio told
+            # us the ring overflowed (samples were discarded before we got
+            # them), or handed back an empty buffer (which discord.py reads
+            # as end-of-source and silently stops the player).
+            "drops": self._overflow_total + self._empty_total,
+            "overflows": self._overflow_total,
+            "empties": self._empty_total,
+            "drift_s": divergence,
+            "drift_ppm": (
+                (divergence / wall_seconds * 1e6) if wall_seconds > 0 else 0.0
+            ),
+            "audio_s": audio_seconds,
+            "wall_s": wall_seconds,
+            # max blocking time since the *previous publish*, so the strip
+            # reacts within a second rather than inheriting a 5 s window
+            "read_ms_max": self._pub_max * 1000.0,
+            "read_ms_mean": (
+                (self._w_sum / self._w_n * 1000.0) if self._w_n else 0.0
+            ),
+            "ring": self._ring_last if self._ring_ok else None,
+        }
+
+        self._pub_max = 0.0
+        self._pub_next = now + self._pub_interval
 
     # -- 5 s summary --------------------------------------------------------
 
@@ -212,6 +431,12 @@ class InstrumentedPCMStream(sound.PCMStream):
         wall_seconds = now - self._wall_start
         divergence = audio_seconds - wall_seconds
         ppm = (divergence / wall_seconds * 1e6) if wall_seconds > 0 else 0.0
+
+        if not VERBOSE:
+            # collection still happened; only the log line is suppressed
+            self._ring_max = -1
+            self._reset_window(now)
+            return
 
         self._log.info(
             "audio: reads=%d/%.1fs read_ms max=%.2f mean=%.2f | overflow=%d(%d tot)"
@@ -259,7 +484,7 @@ class InstrumentedPCMStream(sound.PCMStream):
     def change_device(self, num):
         super().change_device(num)
         logging_setup.log_event(
-            "diag: stream (re)opened on device index=%s samplerate=%s",
+            "audio stream (re)opened on device index=%s samplerate=%s",
             num,
             _probe("stream.samplerate", lambda: self.stream.samplerate, "?"),
         )
@@ -295,6 +520,11 @@ class VoiceStatePoller:
         self._stall_reported = False
         self._park_reported = False
         self._task = None
+
+        # live snapshot for the GUI status strip; see the threading note at
+        # the top of this module
+        self.published = None
+        self.since = time.perf_counter()
 
     # -- one poll, sync and testable ---------------------------------------
 
@@ -335,31 +565,69 @@ class VoiceStatePoller:
     def poll_once(self):
         s = self.sample()
 
-        def f(x):
-            return "n/a" if x is None else (f"{x:.4f}" if isinstance(x, float) else x)
+        # -- classify before logging, so the status strip and the log agree --
 
-        self._log.info(
-            "voice%s: playing=%s paused=%s connected=%s player=%s alive=%s loops=%s"
-            " seq=%s ts=%s lat=%s avg_lat=%s ssrc=%s ws=%s sock=%s",
-            self.label,
-            s["is_playing"],
-            s["is_paused"],
-            s["is_connected"],
-            s["has_player"],
-            s["alive"],
-            f(s["loops"]),
-            f(s["sequence"]),
-            f(s["timestamp"]),
-            f(s["latency"]),
-            f(s["average_latency"]),
-            f(s["ssrc"]),
-            f(s["ws_id"]),
-            f(s["socket_id"]),
+        stalled = s["is_playing"] is True and s["alive"] is False
+        parked = (
+            s["alive"] is True
+            and s["is_playing"] is True
+            and s["loops"] is not None
+            and self._last_loops is not None
+            and s["loops"] == self._last_loops
         )
+
+        self.published = {
+            "t": time.perf_counter(),
+            "since": self.since,
+            "label": self.label,
+            "connected": s["is_connected"],
+            "playing": s["is_playing"],
+            "paused": s["is_paused"],
+            "alive": s["alive"],
+            "loops": s["loops"],
+            "stalled": stalled,
+            "parked": parked,
+            # discord.py reports voice latency in seconds; the strip wants ms
+            "latency_ms": (
+                s["latency"] * 1000.0 if isinstance(s["latency"], float) else None
+            ),
+            "avg_latency_ms": (
+                s["average_latency"] * 1000.0
+                if isinstance(s["average_latency"], float)
+                else None
+            ),
+        }
+
+        if VERBOSE:
+            def f(x):
+                return "n/a" if x is None else (
+                    f"{x:.4f}" if isinstance(x, float) else x
+                )
+
+            self._log.info(
+                "voice%s: playing=%s paused=%s connected=%s player=%s alive=%s"
+                " loops=%s seq=%s ts=%s lat=%s avg_lat=%s ssrc=%s ws=%s sock=%s",
+                self.label,
+                s["is_playing"],
+                s["is_paused"],
+                s["is_connected"],
+                s["has_player"],
+                s["alive"],
+                f(s["loops"]),
+                f(s["sequence"]),
+                f(s["timestamp"]),
+                f(s["latency"]),
+                f(s["average_latency"]),
+                f(s["ssrc"]),
+                f(s["ws_id"]),
+                f(s["socket_id"]),
+            )
 
         # (1) silent-abort signature: discord.py thinks it is playing, the
         #     thread that would be doing the playing is gone.
-        if s["is_playing"] is True and s["alive"] is False:
+        #     NOT gated on VERBOSE -- this is the bug we are hunting, and a
+        #     user who hits it without --diagnose should still have proof.
+        if stalled:
             if not self._stall_reported:
                 self._stall_reported = True
                 self._log.warning(
@@ -377,13 +645,7 @@ class VoiceStatePoller:
             self._stall_reported = False
 
         # (2) park signature: thread alive, loop counter frozen.
-        if (
-            s["alive"] is True
-            and s["is_playing"] is True
-            and s["loops"] is not None
-            and self._last_loops is not None
-            and s["loops"] == self._last_loops
-        ):
+        if parked:
             if not self._park_reported:
                 self._park_reported = True
                 self._log.warning(
@@ -446,8 +708,12 @@ class VoiceStatePoller:
 def make_after(label=""):
     """Build an ``after=`` callback for ``VoiceClient.play()``.
 
-    Returns ``None`` when diagnostics are off, so the call site collapses to
-    upstream's ``play(source, after=None)`` exactly.
+    Returns ``None`` unless ``--diagnose`` is on, so the normal call site
+    collapses to upstream's ``play(source, after=None)`` exactly. This one
+    stays behind the flag on purpose: unlike the passive read/poll probes,
+    it changes what gets handed to ``VoiceClient.play()``, and the status
+    strip does not need it -- :class:`VoiceStatePoller` already detects a
+    dead player thread within one poll interval.
 
     ``AudioPlayer.run`` calls this from a ``finally``, so it fires on
     *every* exit path -- including the bare ``return`` at player.py:819,
@@ -455,7 +721,7 @@ def make_after(label=""):
     this makes it announce itself with a wall-clock timestamp and the
     thread name.
     """
-    if not ENABLED:
+    if not VERBOSE:
         return None
 
     def after(error):
@@ -488,19 +754,29 @@ def make_after(label=""):
 
 
 def make_stream():
-    """Return an instrumented stream, or upstream's plain ``PCMStream``."""
-    return InstrumentedPCMStream() if ENABLED else sound.PCMStream()
+    """Return the instrumented stream and register it for :func:`snapshot`.
+
+    Always instrumented now: the status strip needs live numbers on every
+    session, and the measured cost of the override is 0.22 us per
+    ``read()`` against a 20 000 us budget. ``--diagnose`` only decides
+    whether the 5-second summary lines are written.
+    """
+    stream = InstrumentedPCMStream()
+    _register_stream(stream)
+    return stream
 
 
 def attach(voice, label="", previous=None):
-    """Start a :class:`VoiceStatePoller` for ``voice``. No-op when disabled.
+    """Start a :class:`VoiceStatePoller` for ``voice``.
 
     ``previous`` (the poller from an earlier connect on the same UI row) is
     cancelled first, so reconnecting does not accumulate poller tasks.
+    Returns None if there is nothing to poll or the task could not start --
+    the strip renders that as "no data", never as "healthy".
     """
     detach(previous)
 
-    if not ENABLED or voice is None:
+    if voice is None:
         return None
 
     poller = VoiceStatePoller(voice, label=label)
@@ -509,12 +785,15 @@ def attach(voice, label="", previous=None):
     except Exception:
         log.exception("failed to start voice poller%s", label)
         return None
+
+    _register_poller(poller)
     return poller
 
 
 def detach(poller):
     """Cancel a poller returned by :func:`attach`. Always returns None."""
     if poller is not None:
+        _unregister_poller(poller)
         try:
             poller.stop()
         except Exception:
