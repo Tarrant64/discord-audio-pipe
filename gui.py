@@ -2,6 +2,8 @@ import os
 import sys
 import sound
 import asyncio
+import instrumentation
+import logging_setup
 import logging
 import discord
 from PyQt6.QtSvgWidgets import QSvgWidget
@@ -67,9 +69,10 @@ class SVGButton(QPushButton):
 
 class Connection:
     def __init__(self, layer, parent):
-        self.stream = sound.PCMStream()
+        self.stream = instrumentation.make_stream()
         self.parent = parent
         self.voice = None
+        self.poller = None
 
         # dropdowns
         self.devices = Dropdown()
@@ -129,6 +132,7 @@ class Connection:
     def change_device(self):
         try:
             selection = self.devices.currentData()
+            logging_setup.log_device(selection, self.devices.currentText().strip())
             self.mute.setText("Mute")
 
             if self.voice is not None:
@@ -136,7 +140,7 @@ class Connection:
                 self.stream.change_device(selection)
 
                 if self.voice.is_connected():
-                    self.voice.play(self.stream, fec=False, signal_type='music')
+                    self.voice.play(self.stream, fec=False, signal_type='music', after=instrumentation.make_after())
 
             else:
                 self.stream.change_device(selection)
@@ -179,16 +183,21 @@ class Connection:
                 else:
                     await self.voice.move_to(selection)
 
+                logging_setup.log_event("joined %s / %s", selection.guild, selection)
+                self.poller = instrumentation.attach(self.voice, f" [{selection}]", self.poller)
+
                 not_playing = (
                     self.devices.currentData() is not None
                     and not self.voice.is_playing()
                 )
 
                 if not_playing:
-                    self.voice.play(self.stream, fec=False, signal_type='music')
+                    self.voice.play(self.stream, fec=False, signal_type='music', after=instrumentation.make_after(f" [{selection}]"))
 
             else:
                 if self.voice is not None:
+                    logging_setup.log_event("leaving voice (channel set to None)")
+                    self.poller = instrumentation.detach(self.poller)
                     await self.voice.disconnect()
 
         except asyncio.TimeoutError:

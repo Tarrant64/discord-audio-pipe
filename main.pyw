@@ -1,20 +1,14 @@
 import logging
+import logging_setup
 
-# error logging
-error_formatter = logging.Formatter(
-    fmt="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-
-error_handler = logging.FileHandler("DAP_errors.log", delay=True)
-error_handler.setLevel(logging.ERROR)
-error_handler.setFormatter(error_formatter)
-
-base_logger = logging.getLogger()
-base_logger.addHandler(error_handler)
+# error logging (installed before any other import, as upstream did, so that
+# import-time failures still reach DAP_errors.log)
+logging_setup.configure()
 
 import sys
 import cli
 import sound
+import instrumentation
 import asyncio
 import discord
 import argparse
@@ -39,6 +33,13 @@ parser.add_argument(
     dest="verbose",
     action="store_true",
     help="Enable verbose logging",
+)
+
+parser.add_argument(
+    "--diagnose",
+    dest="diagnose",
+    action="store_true",
+    help="Enable audio/voice-state diagnostics (see DAP_session.log)",
 )
 
 connect.add_argument(
@@ -80,18 +81,13 @@ is_gui = not any([args.channel, args.device, args.query, args.online])
 
 # verbose logs
 if args.verbose:
-    debug_formatter = logging.Formatter(
-        fmt="%(asctime)s:%(levelname)s:%(name)s: %(message)s"
-    )
+    logging_setup.enable_verbose()
 
-    debug_handler = logging.FileHandler(
-        filename="discord.log", encoding="utf-8", mode="w"
-    )
-    debug_handler.setFormatter(debug_formatter)
+# diagnostics
+if args.diagnose:
+    instrumentation.enable()
 
-    debug_logger = logging.getLogger("discord")
-    debug_logger.setLevel(logging.DEBUG)
-    debug_logger.addHandler(debug_handler)
+logging_setup.log_start(args, diagnose=args.diagnose)
 
 # don't import qt stuff if not using gui
 if is_gui:
@@ -170,3 +166,5 @@ try:
     asyncio.run(main(bot))
 except KeyboardInterrupt:
     print("Exiting...")
+finally:
+    logging_setup.log_shutdown()
