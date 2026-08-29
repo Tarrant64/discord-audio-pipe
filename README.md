@@ -180,23 +180,40 @@ process immediately — no Python traceback, nothing flushed to any log file,
 just a native "Abort trap: 6". The PyQt5 → PyQt6 migration therefore turned
 every unguarded slot into a potential silent crash.
 
-PyQt makes one exception: if `sys.excepthook` has been replaced, it hands
-the exception to the replacement instead of aborting. `main.pyw` installs
-such a hook (`logging_setup.install_excepthook`) before PyQt is imported. It
-logs the traceback to `DAP_errors.log`, notes the event in
-`DAP_session.log`, and returns, so the app survives.
+**The fix is `gui.guarded_slot`.** It wraps a method in try/except +
+`logging.exception` and is applied to every method connected to a Qt signal
+and to the reimplemented virtuals Qt calls directly (`paintEvent`,
+`resizeEvent`, `closeEvent`, the mouse handlers). The exception never
+escapes, so `qFatal` is never reached — on any build. `sizeHint` and
+`minimumSizeHint` must hand a `QSize` back to C++, so they keep a
+hand-written guard with Qt's own hint as the fallback.
 
-Measured, with a slot raising `RuntimeError` from `setCurrentIndex()`:
+A test walks `gui.py`, collects every `.connect(self.…)` target, and fails
+if any of them is undecorated, so the guarantee does not depend on someone
+remembering.
 
-| `sys.excepthook` | outcome |
-|---|---|
-| default | exit 134 (SIGABRT), slot never returns |
-| replaced | exit 0, hook runs, execution continues |
+`main.pyw` also installs a `sys.excepthook`
+(`logging_setup.install_excepthook`). **That records crashes; it does not
+prevent them.** `pyqt6_err_print()` runs the hook and then calls `qFatal()`
+anyway on at least some builds. Measured with a slot raising `RuntimeError`
+from `setCurrentIndex()`:
 
-The hook is the net, not the plan: slot bodies still catch their own
-exceptions. Anything reachable from a signal — including the profile
-restore, which drives `setCurrentIndex()` on devices, servers and channels
-that may all have disappeared — must not let an exception escape.
+| slot | `sys.excepthook` | outcome |
+|---|---|---|
+| unguarded | default | exit 134 (SIGABRT) |
+| unguarded | replaced | exit 0 on PyQt6 6.11.0/macOS; crash reports from another machine show `qFatal` reached anyway |
+| **guarded** | either | **exit 0, traceback in `DAP_errors.log`** |
+
+The middle row is exactly why the hook is not the safety mechanism. Keep it
+for the traceback; rely on the decorator for survival.
+
+One gotcha the decorator introduces: PyQt normally inspects a slot's arity
+and passes only as many signal arguments as it accepts. The wrapper takes
+`*args`, so every argument is passed instead. A slot wired to `clicked`
+(which carries `checked`) or to `Dropdown.changed` (two arguments) must
+accept them, or it raises `TypeError` — which the decorator then swallows,
+leaving a control that silently does nothing. There is a test that fires
+every slot and asserts none of them logged.
 
 ## Logging and diagnostics
 

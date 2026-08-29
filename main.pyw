@@ -5,10 +5,11 @@ import logging_setup
 # import-time failures still reach DAP_errors.log)
 logging_setup.configure()
 
-# Safety net for exceptions that escape a Qt slot. Installed here, before
-# PyQt is imported and long before any widget exists, because PyQt6 turns
-# such an exception into abort() unless sys.excepthook has been replaced --
-# see logging_setup.install_excepthook() for the measurements.
+# Capture the traceback of any exception that escapes a Qt slot, so a crash
+# leaves something readable in DAP_errors.log instead of only a native
+# "Abort trap: 6". This RECORDS crashes; it does not prevent them -- PyQt6
+# may call qFatal() regardless of what the hook does. Prevention is
+# gui.guarded_slot. See logging_setup.install_excepthook() for measurements.
 logging_setup.install_excepthook()
 
 import sys

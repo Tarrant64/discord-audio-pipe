@@ -1,5 +1,6 @@
 import os
 import sys
+import functools
 import sound
 import asyncio
 import config
@@ -118,6 +119,64 @@ STATE_WARN = "warn"
 STATE_FAIL = "fail"
 
 
+# ===========================================================================
+# Slot safety
+# ===========================================================================
+
+
+def guarded_slot(method):
+    """Stop an exception in ``method`` from escaping back into Qt.
+
+    **This is the crash guard.** Under PyQt5 an exception that escaped a
+    Python slot was printed and execution continued. PyQt6 routes it through
+    ``pyqt6_err_print()``, which prints it and then calls ``qFatal()`` ->
+    ``abort()``. The process dies where it stands: no Python traceback, no
+    flushed log, just a native "Abort trap: 6" that a user has no reason to
+    send us. The PyQt5 -> PyQt6 migration turned every unguarded slot in
+    this file into a potential silent crash.
+
+    A replaced ``sys.excepthook`` is *not* a reliable substitute. It does get
+    invoked -- which is why we still install one, to capture the traceback --
+    but whether control ever returns to Python afterwards is a property of
+    the PyQt build. On PyQt6 6.11.0 / Qt 6.11.0 the abort was observed not to
+    happen with a hook installed; crash reports from another machine show
+    ``qFatal`` being reached anyway. So the hook is treated as diagnostics
+    only, and never as the thing that keeps the app alive.
+
+    The only thing that works everywhere is the exception not escaping. This
+    decorator is applied to every method connected to a Qt signal, and to the
+    reimplemented virtuals Qt calls directly, so the guarantee is structural
+    rather than a matter of remembering.
+
+    Returns ``None`` on failure, so it suits void slots. Methods that must
+    return a value to Qt (``sizeHint`` and friends) keep a hand-written
+    try/except with a meaningful fallback instead.
+
+    One consequence to know about: PyQt normally introspects a slot's
+    arity and passes only as many signal arguments as it will accept.
+    The wrapper takes ``*args``, so that negotiation stops working and
+    every argument is passed. Decorated slots therefore have to accept
+    what their signal actually sends -- hence the ``*_`` on the ones
+    wired to ``clicked`` (which carries ``checked``) and to
+    ``Dropdown.changed`` (which carries two). Getting this wrong is a
+    TypeError the decorator itself swallows, i.e. a button that quietly
+    stops working, so it is covered by a test.
+    """
+
+    @functools.wraps(method)
+    def wrapper(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except Exception:
+            logging.exception(
+                "Unhandled exception in slot %s -- contained, continuing",
+                getattr(method, "__qualname__", method),
+            )
+            return None
+
+    return wrapper
+
+
 class Dropdown(QComboBox):
     """Combo box that fits its contents, within limits, and elides the rest.
 
@@ -187,14 +246,26 @@ class Dropdown(QComboBox):
         metrics = QFontMetrics(self.font())
         return self.chrome_width() + metrics.averageCharWidth() * chars
 
+    # These two are called by Qt's layout engine, not by our code, so they
+    # carry the same "an exception here aborts the process" hazard as a slot
+    # -- and the layout runs constantly during a profile restore. They cannot
+    # use @guarded_slot because they must hand a QSize back to C++; instead
+    # the custom narrowing is guarded and Qt's own hint is the fallback.
+
     def sizeHint(self):
         hint = super().sizeHint()
-        hint.setWidth(min(hint.width(), self.width_for(self.MAX_CHARS)))
+        try:
+            hint.setWidth(min(hint.width(), self.width_for(self.MAX_CHARS)))
+        except Exception:
+            logging.exception("Error computing dropdown size hint")
         return hint
 
     def minimumSizeHint(self):
         hint = super().minimumSizeHint()
-        hint.setWidth(min(hint.width(), self.width_for(self.MIN_CHARS)))
+        try:
+            hint.setWidth(min(hint.width(), self.width_for(self.MIN_CHARS)))
+        except Exception:
+            logging.exception("Error computing dropdown minimum size hint")
         return hint
 
     # -- elision -----------------------------------------------------------
@@ -211,6 +282,7 @@ class Dropdown(QComboBox):
             self,
         ).width()
 
+    @guarded_slot
     def sync_tooltip(self):
         """Expose the full text through the tooltip iff it is being elided.
 
@@ -233,17 +305,20 @@ class Dropdown(QComboBox):
         except Exception:
             logging.exception("Error syncing dropdown tooltip")
 
+    @guarded_slot
     def refresh(self):
         """Re-measure after the item list changed."""
         self.updateGeometry()
         self.sync_tooltip()
 
+    @guarded_slot
     def resizeEvent(self, event):
         # The tooltip depends on how much room the layout actually granted,
         # which is only known once the widget has been given its geometry.
         super().resizeEvent(event)
         self.sync_tooltip()
 
+    @guarded_slot
     def paintEvent(self, event):
         # Mirrors QComboBox::paintEvent, with the label text elided to the
         # edit field before it is drawn. Qt's own implementation clips
@@ -265,6 +340,7 @@ class Dropdown(QComboBox):
 
         painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
 
+    @guarded_slot
     def changed_signal(self, selected):
         # Slot. Anything that escapes here goes back into Qt, and PyQt6
         # answers that with abort() -- see
@@ -350,12 +426,14 @@ class Connection:
 
     # -- slots --------------------------------------------------------------
 
+    @guarded_slot
     def on_server_changed(self, deselected, selected):
         try:
             asyncio.create_task(self.change_server(deselected, selected))
         except Exception:
             logging.exception("Error dispatching change_server")
 
+    @guarded_slot
     def on_channel_changed(self, *_):
         try:
             asyncio.create_task(self.change_channel())
@@ -443,7 +521,8 @@ class Connection:
 
         return row
 
-    def change_device(self):
+    @guarded_slot
+    def change_device(self, *_):
         try:
             selection = self.devices.currentData()
             logging_setup.log_device(selection, self.devices.currentText().strip())
@@ -532,7 +611,8 @@ class Connection:
             self.setEnabled(True)
             self.parent.profile_changed()
 
-    def toggle_mute(self):
+    @guarded_slot
+    def toggle_mute(self, *_):
         try:
             if self.voice is not None:
                 if self.voice.is_playing():
@@ -659,6 +739,7 @@ class StatusStrip(QFrame):
 
     # -- settings -----------------------------------------------------------
 
+    @guarded_slot
     def on_auto_recover_toggled(self, checked):
         try:
             self.config.set("auto_recover", bool(checked))
@@ -666,6 +747,7 @@ class StatusStrip(QFrame):
         except Exception:
             logging.exception("Error saving auto_recover setting")
 
+    @guarded_slot
     def on_auto_connect_toggled(self, checked):
         try:
             self.config.set("auto_connect", bool(checked))
@@ -807,6 +889,7 @@ class StatusStrip(QFrame):
                 widget.style().unpolish(widget)
                 widget.style().polish(widget)
 
+    @guarded_slot
     def refresh(self, snap=None):
         try:
             if snap is None:
@@ -872,7 +955,8 @@ class TitleBar(QFrame):
         minimize_button.clicked.connect(self.minimize)
         close_button.clicked.connect(self.on_close_clicked)
 
-    def on_close_clicked(self):
+    @guarded_slot
+    def on_close_clicked(self, *_):
         # Same guard as Connection's async slots: create_task() raises
         # RuntimeError with no running loop, and under PyQt6 that would
         # abort the process instead of just failing to close the window.
@@ -885,7 +969,8 @@ class TitleBar(QFrame):
         await self.bot.close()
         self.parent.close()
 
-    def minimize(self):
+    @guarded_slot
+    def minimize(self, *_):
         self.parent.showMinimized()
 
 
@@ -1029,16 +1114,19 @@ class GUI(QMainWindow):
         # show window
         self.show()
 
+    @guarded_slot
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.position = event.position().toPoint()
             event.accept()
 
+    @guarded_slot
     def mouseMoveEvent(self, event):
         if self.position is not None and event.buttons() == Qt.MouseButton.LeftButton:
             self.move(QCursor.pos() - self.position)
             event.accept()
 
+    @guarded_slot
     def mouseReleaseEvent(self, event):
         self.position = None
         event.accept()
@@ -1048,7 +1136,8 @@ class GUI(QMainWindow):
         for connection in self.connections:
             connection.setEnabled(enabled)
 
-    def add_connection(self):
+    @guarded_slot
+    def add_connection(self, *_):
         # Slot ("+" button) and also called directly by restore_devices().
         # Guarded because an exception escaping a slot is fatal under PyQt6
         # -- see logging_setup.install_excepthook().
@@ -1088,6 +1177,7 @@ class GUI(QMainWindow):
     # the rest of the row through. Nothing here may raise: a bad profile must
     # not stop the app from starting.
 
+    @guarded_slot
     def grow_to_hint(self):
         """Widen the window if the layout now needs more room.
 
@@ -1119,6 +1209,7 @@ class GUI(QMainWindow):
         except Exception:
             logging.exception("Error growing the window to its size hint")
 
+    @guarded_slot
     def profile_changed(self):
         """A dropdown changed; schedule a save. Cheap, call it freely."""
         if self._restoring:
@@ -1129,6 +1220,7 @@ class GUI(QMainWindow):
         except Exception:
             logging.exception("Error scheduling profile save")
 
+    @guarded_slot
     def save_profile(self):
         """Write every row's current state. Never raises."""
         try:
@@ -1138,6 +1230,7 @@ class GUI(QMainWindow):
         except Exception:
             logging.exception("Error saving profile")
 
+    @guarded_slot
     def flush_profile(self):
         """Write a pending debounced save immediately, if there is one."""
         try:
@@ -1365,6 +1458,7 @@ class GUI(QMainWindow):
         # does not resize a window that already has a size.
         Connection.resize_combobox(dropdown)
 
+    @guarded_slot
     def closeEvent(self, event):
         # A change made in the last few hundred milliseconds still has its
         # save sitting in the debounce timer. Land it before the process goes

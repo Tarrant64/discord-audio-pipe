@@ -215,36 +215,40 @@ _excepthook_installed = False
 
 
 def install_excepthook():
-    """Stop an unhandled exception in a Qt slot from killing the process.
+    """Capture the traceback of an exception that escaped a Qt slot.
 
-    This is not belt-and-braces. It is load-bearing, and it is a regression
-    the PyQt5 -> PyQt6 migration introduced.
+    **This records the crash. It does not prevent it.** Read that again
+    before relying on it for anything.
 
     Under PyQt5, an exception that escaped a Python slot back into C++ was
-    printed and execution continued. PyQt6 calls ``qFatal()`` instead, which
-    calls ``abort()``: the whole application dies instantly, with a native
-    "Abort trap: 6" crash report and *nothing at all* in DAP_errors.log,
-    because the process is gone before anything can be flushed.
+    printed and execution continued. PyQt6 hands it to
+    ``pyqt6_err_print()``, which prints it -- that is where this hook gets
+    its turn -- and then calls ``qFatal()`` -> ``abort()``. On the observed
+    stacks, ``qFatal`` is reached from inside ``err_print`` regardless of
+    what the hook did, so a hook that "logs and returns" does not
+    necessarily get to return anywhere.
 
-    PyQt makes exactly one exception to that: if ``sys.excepthook`` has been
-    replaced, it hands the exception to the replacement and does **not**
-    abort. So installing any non-default hook is what keeps the app alive.
-
-    Measured, not assumed -- a slot raising RuntimeError, triggered by
+    Measurements do not agree across builds, which is exactly why this is
+    not the safety mechanism. A slot raising RuntimeError from
     ``QComboBox.setCurrentIndex()``:
 
-        default sys.excepthook  -> exit 134 (SIGABRT), slot never returns
-        replaced sys.excepthook -> exit 0, hook runs, execution continues
+        PyQt6 6.11.0 / Qt 6.11.0, macOS   default hook  -> exit 134 (SIGABRT)
+                                          replaced hook -> exit 0, continued
+        another machine's crash reports   replaced hook -> qFatal reached
 
-    This matters most for anything that sets a widget's value in code rather
-    than in response to a click -- the saved-profile restore, above all. A
-    restore touches a device that may have been unplugged, a guild the bot
-    may have been removed from and a channel that may have been deleted, and
-    every one of those paths runs inside a slot.
+    So: the hook is worth having, because a crash whose traceback reached
+    DAP_errors.log is diagnosable and a native "Abort trap: 6" is not. It is
+    NOT what keeps the app alive.
 
-    Individual slot bodies still catch their own exceptions; this is the net
-    under the ones we missed. Only covers the main thread -- worker threads
-    go through ``threading.excepthook``, which is untouched.
+    What keeps the app alive is ``gui.guarded_slot``: the exception never
+    escaping the slot in the first place. That works on every build, and it
+    is the mechanism the profile restore depends on -- restore drives
+    ``setCurrentIndex()`` on a device that may have been unplugged, a guild
+    the bot may have been removed from and a channel that may have been
+    deleted.
+
+    Only covers the main thread -- worker threads go through
+    ``threading.excepthook``, which is untouched.
     """
     global _excepthook_installed
 
