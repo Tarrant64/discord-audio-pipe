@@ -85,6 +85,7 @@ class Connection:
         # mute
         self.mute = SVGButton("Mute")
         self.mute.setObjectName("mute")
+        self.mute.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # add widgets
         parent.layout.addWidget(self.devices, layer, 0)
@@ -244,12 +245,12 @@ class TitleBar(QFrame):
         # minimize
         minimize_button = QPushButton("—")
         minimize_button.setObjectName("minimize")
-        layout.addWidget(minimize_button)
+        minimize_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # close
         close_button = QPushButton("✕")
         close_button.setObjectName("close")
-        layout.addWidget(close_button)
+        close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # add widgets
         layout.addWidget(title)
@@ -289,10 +290,13 @@ class GUI(QMainWindow):
         # layout
         central = QWidget()
         self.layout = QGridLayout()
+        self.layout.setSpacing(10)
+        self.layout.setContentsMargins(20, 16, 20, 20)
         central.setLayout(self.layout)
 
         # labels
         self.info = QLabel("Connecting...")
+        self.info.setObjectName("info")
         device_lb = QLabel("Devices")
         device_lb.setObjectName("label")
         server_lb = QLabel("Servers     ")
@@ -308,6 +312,7 @@ class GUI(QMainWindow):
         # new connections
         self.connection_btn = QPushButton("＋", self)
         self.connection_btn.setObjectName("connection_btn")
+        self.connection_btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # add widgets
         self.layout.addWidget(self.info, 0, 0, 1, 3)
@@ -321,6 +326,7 @@ class GUI(QMainWindow):
 
         # build window
         titlebar = TitleBar(self)
+        titlebar.setFixedHeight(36)
         self.setMenuWidget(titlebar)
         self.setCentralWidget(central)
         self.setEnabled(False)
