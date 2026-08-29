@@ -6,3 +6,8 @@ token.txt
 main.py
 build/main
 .vscode
+venv/
+.venv/
+*.pyc
+build/dist/
+dist/

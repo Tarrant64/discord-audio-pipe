@@ -96,11 +96,11 @@ if args.verbose:
 # don't import qt stuff if not using gui
 if is_gui:
     import gui
-    from PyQt5.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtWidgets import QApplication, QMessageBox
 
     app = QApplication(sys.argv)
     msg = QMessageBox()
-    msg.setIcon(QMessageBox.Information)
+    msg.setIcon(QMessageBox.Icon.Information)
 
 # main
 async def main(bot):

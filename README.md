@@ -13,12 +13,13 @@ You can download the latest release [**here**](https://github.com/QiCuiHub/disco
 2. To link the program to your bot, create a file ``token.txt`` in the same directory as the `.exe` / `main.pyw` and save the bot token inside
 
 ## Dependencies
-Requires Python 3.8+. Install dependencies by running `pip3 install -r requirements.txt`
+Requires Python 3.10+ (PyQt6 6.11 does not support older versions). Install dependencies by running `pip3 install -r requirements.txt`
 
 In some cases PortAudio and xcb libraries may be missing on linux. On Ubuntu they can be installed with
 ```
     $ sudo apt-get install libportaudio2
     $ sudo apt-get install libxcb-xinerama0
+    $ sudo apt-get install libxcb-cursor0
 ```
 macOS requires PortAudio and Opus libraries
 ```

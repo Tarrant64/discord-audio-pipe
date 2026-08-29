@@ -4,10 +4,10 @@ import sound
 import asyncio
 import logging
 import discord
-from PyQt5.QtSvg import QSvgWidget
-from PyQt5.QtGui import QFontDatabase, QFontMetrics, QIcon, QCursor
-from PyQt5.QtCore import Qt, QCoreApplication, QEventLoop, QDir, pyqtSignal
-from PyQt5.QtWidgets import (
+from PyQt6.QtSvgWidgets import QSvgWidget
+from PyQt6.QtGui import QFontDatabase, QFontMetrics, QIcon, QCursor
+from PyQt6.QtCore import Qt, QCoreApplication, QEventLoop, QDir, pyqtSignal
+from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QWidget,
@@ -268,7 +268,7 @@ class GUI(QMainWindow):
         self.app = app
 
         # window info
-        self.setWindowFlags(self.windowFlags() | Qt.FramelessWindowHint)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
         window_icon = QIcon("./assets/favicon.ico")
         self.setWindowTitle("Discord Audio Pipe")
         self.app.setWindowIcon(window_icon)
@@ -325,12 +325,12 @@ class GUI(QMainWindow):
         self.show()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.position = event.pos()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.position = event.position().toPoint()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self.position is not None and event.buttons() == Qt.LeftButton:
+        if self.position is not None and event.buttons() == Qt.MouseButton.LeftButton:
             self.move(QCursor.pos() - self.position)
             event.accept()
 
@@ -372,7 +372,7 @@ class GUI(QMainWindow):
 
     async def run_Qt(self, interval=0.01):
         while True:
-            QCoreApplication.processEvents(QEventLoop.AllEvents, int(interval * 1000))
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, int(interval * 1000))
             await asyncio.sleep(interval)
 
     async def ready(self):
