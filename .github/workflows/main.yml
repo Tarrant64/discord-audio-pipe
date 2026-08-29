@@ -49,7 +49,6 @@ jobs:
             spec: './build/main.spec'
             source_ref: ''
             artifact: 'dap-modern-win64'
-            asset_suffix: ''
 
           # Control build: the exact pre-modernization toolchain, pins, spec AND
           # application sources. source_ref is the last upstream commit before the
@@ -74,7 +73,6 @@ jobs:
             spec: './build/main-baseline.spec'
             source_ref: 'b9ea7bf'
             artifact: 'dap-baseline-win64'
-            asset_suffix: '-baseline'
 
     steps:
       - uses: actions/checkout@v4
@@ -148,13 +146,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # MODERN LEG ONLY - do not relax this condition.
+      #
+      # The baseline leg freezes the pre-modernization sources checked out from
+      # b9ea7bf built with the original toolchain. It contains NONE of this fork's
+      # features and is an internal control for build comparisons, nothing else.
+      # Attaching it to a release publishes upstream-era code under our release tag,
+      # where users download it and report bugs against software we did not write.
+      #
+      # The baseline artifact is still retained - the "Upload build artifact" step
+      # above uploads it via actions/upload-artifact, which is where it belongs:
+      # visible to us, never offered to users as a download.
       - name: Attach exe to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && matrix.leg == 'modern'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $uploadPath = "./dist/dap.exe"
-          $fileName = "dap-${{ github.event.release.tag_name }}-win64${{ matrix.asset_suffix }}"
+          $fileName = "dap-${{ github.event.release.tag_name }}-win64"
           $uri = "https://uploads.github.com/repos/$Env:GITHUB_REPOSITORY/releases/${{ github.event.release.id }}/assets?name=$fileName.exe"
           $headers = @{
             "Content-Type"  = "application/x-msdownload"
