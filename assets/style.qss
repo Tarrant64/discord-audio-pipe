@@ -1,120 +1,454 @@
+/* ==========================================================================
+   Discord Audio Pipe — dark theme
+   --------------------------------------------------------------------------
+   Palette (hex is repeated inline; Qt Style Sheets have no variables)
+
+     titlebar chrome   #131417
+     window / panel    #24262C
+     control "well"    #1B1D21   (inputs sit below the panel, not above it)
+     control hover     #212429
+     control pressed   #17191C
+     popup surface     #202329
+     hairline border   #383C44   hover #4E545F
+     focus ring        #6B76F0
+     primary text      #E8EAED   muted #9AA0A6   titlebar #A8ADB5
+     accent (mute)     #5561E8   hover #5C68EE   pressed #4550D4
+     add / success     #43B581
+     danger (close)    #D83C3E
+
+   Contrast (WCAG 2.1, computed):
+     #E8EAED on #24262C panel ....... 12.6:1
+     #E8EAED on #1B1D21 control ..... 14.0:1
+     #9AA0A6 muted labels on panel ... 5.7:1
+     #A8ADB5 on #131417 titlebar ..... 8.2:1
+     white on #5561E8 accent ......... 4.9:1  (hover 4.5:1)
+     white on #D83C3E close hover .... 4.5:1
+     #43B581 add glyph on control .... 5.7:1
+     #6B76F0 focus ring vs control ... 4.4:1  (non-text, needs 3:1)
+     arrow #6B6D72 vs control ........ 3.3:1  (non-text, needs 3:1)
+
+   Qt Style Sheets support no transitions, shadows, transforms or variables —
+   depth is done with flat layered surfaces and hairline borders only.
+   ========================================================================== */
+
+
+/* --- base ---------------------------------------------------------------- */
+
 QWidget {
-    background-color: #303339;
-    font: 12pt "Roboto";
-    color: white;
+    background-color: #24262C;
+    color: #E8EAED;
+    font-family: "Roboto";
+    font-size: 12pt;
 }
+
+QMainWindow {
+    background-color: #24262C;
+}
+
+/* the "Logged in as: ..." status line; the labelled column headers below
+   override this via the more specific QLabel#label rule */
+QLabel {
+    background-color: transparent;
+    color: #E8EAED;
+    font-size: 11pt;
+    padding: 2px 2px 8px 2px;
+}
+
+QLabel#label {
+    background-color: transparent;
+    font-size: 10pt;
+    color: #9AA0A6;
+    padding: 6px 2px 2px 3px;
+}
+
+QLabel:disabled {
+    color: #63686F;
+}
+
+
+/* --- title bar ----------------------------------------------------------- */
 
 QFrame#titlebar {
-    background-color: #202225;
-}
-
-QFrame#titlebar > * {
+    background-color: #131417;
     border: none;
-    font: 10pt "Roboto";
-    background-color: #202225;
-    color: #72767D;
+    border-bottom: 1px solid #0E0F12;
 }
 
 QFrame#titlebar QLabel {
-    padding: 5px;
+    background-color: transparent;
+    border: none;
+    font-size: 10pt;
+    color: #A8ADB5;
+    padding: 7px 12px;
 }
 
 QFrame#titlebar QPushButton {
-    min-height: 25px;
-    min-width: 40px;
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
+    font-size: 11pt;
+    color: #A8ADB5;
+    min-height: 32px;
+    min-width: 44px;
+    padding: 0px;
 }
 
-QPushButton#close::hover {
-    background-color: #F04747;
+QFrame#titlebar QPushButton:hover {
+    background-color: #23252B;
+    color: #E8EAED;
 }
 
-QPushButton#minimize::hover {
-    background-color: #282B2E;
+QFrame#titlebar QPushButton:pressed {
+    background-color: #1A1C21;
 }
+
+QFrame#titlebar QPushButton:focus {
+    background-color: #23252B;
+    color: #E8EAED;
+    border-bottom: 2px solid #6B76F0;
+}
+
+QFrame#titlebar QPushButton:disabled {
+    color: #55595F;
+    background-color: transparent;
+}
+
+/* these must out-specify "QFrame#titlebar QPushButton:hover" above, hence the
+   redundant-looking descendant prefix */
+QFrame#titlebar QPushButton#close:hover {
+    background-color: #D83C3E;
+    color: #FFFFFF;
+}
+
+QFrame#titlebar QPushButton#close:pressed {
+    background-color: #B02F31;
+    color: #FFFFFF;
+}
+
+QFrame#titlebar QPushButton#close:focus {
+    background-color: #23252B;
+    color: #E8EAED;
+    border-bottom: 2px solid #D83C3E;
+}
+
+QFrame#titlebar QPushButton#minimize:hover {
+    background-color: #23252B;
+    color: #E8EAED;
+}
+
+QFrame#titlebar QPushButton#minimize:pressed {
+    background-color: #1A1C21;
+}
+
+
+/* --- dropdowns ----------------------------------------------------------- */
 
 QComboBox {
-    border: solid #282A2F;
-    border-width: 1px;
-    border-radius: 3px;
-    background-color: #303339;
-    min-height: 30px;
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    min-height: 34px;
+    padding-left: 12px;
+    padding-right: 4px;
+    margin: 3px 2px;
+    outline: none;
 }
 
-QComboBox::hover {
-    border-color: black;
+QComboBox:hover {
+    background-color: #212429;
+    border-color: #4E545F;
+}
+
+QComboBox:focus {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+/* popup is open */
+QComboBox:on {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+QComboBox:pressed {
+    background-color: #17191C;
+    border-color: #6B76F0;
+}
+
+QComboBox:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
 }
 
 QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    background-color: transparent;
     border: none;
+    width: 32px;
 }
 
 QComboBox::down-arrow {
     image: url(./assets/arrow-drop-down-line.svg);
+    width: 18px;
+    height: 18px;
+}
+
+/* the arrow SVG has a baked-in fill, so the disabled state keeps the same
+   glyph and relies on the dimmed field around it */
+
+
+/* --- dropdown popup list ------------------------------------------------- */
+
+/* The popup is a QFrame container (QComboBoxPrivateContainer) wrapping the
+   view. Left unstyled it paints the window colour, which shows as a dark
+   square ring around the rounded list. Painting it the popup colour hides the
+   corner slivers without relying on window translucency, which is not
+   dependable across platforms. */
+QComboBox QFrame {
+    background-color: #202329;
+    border: none;
 }
 
 QAbstractItemView {
-    border: solid black;
-    border-radius: 3px;
-    border-width: 1px;
+    background-color: #202329;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    padding: 4px;
     outline: none;
+    selection-background-color: #2F3442;
+    selection-color: #FFFFFF;
 }
 
 QAbstractItemView::item {
-    min-height: 30px;
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    color: #E8EAED;
+    min-height: 32px;
+    padding-left: 8px;
+    padding-right: 8px;
 }
 
-QAbstractItemView::item::selected {
-    background-color: #26272B;
+QAbstractItemView::item:hover {
+    background-color: #2A2E36;
 }
 
-QAbstractItemView::item::hover {
-    background-color: #2A2C30;
+QAbstractItemView::item:selected {
+    background-color: #2F3442;
+    color: #FFFFFF;
 }
+
+QAbstractItemView::item:disabled {
+    color: #5A5F66;
+}
+
+
+/* --- popup scrollbar ----------------------------------------------------- */
+
+QScrollBar:vertical {
+    background-color: transparent;
+    border: none;
+    width: 10px;
+    margin: 4px 2px 4px 0px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #3C414A;
+    border: none;
+    border-radius: 4px;
+    min-height: 28px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #4E545F;
+}
+
+QScrollBar::handle:vertical:pressed {
+    background-color: #6B76F0;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    background-color: transparent;
+    border: none;
+    height: 0px;
+}
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background-color: transparent;
+}
+
+QScrollBar:horizontal {
+    background-color: transparent;
+    border: none;
+    height: 10px;
+    margin: 0px 4px 2px 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #3C414A;
+    border: none;
+    border-radius: 4px;
+    min-width: 28px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #4E545F;
+}
+
+QScrollBar::handle:horizontal:pressed {
+    background-color: #6B76F0;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    background-color: transparent;
+    border: none;
+    width: 0px;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background-color: transparent;
+}
+
+
+/* --- mute button --------------------------------------------------------- */
 
 QPushButton#mute {
-    border-radius: 2px;
-    background-color: #7289DA;
-    color: white;
-    min-height: 30px;
-    min-width: 80px;
-    max-width: 80px;
+    background-color: #5561E8;
+    border: 1px solid #5561E8;
+    border-radius: 8px;
+    color: #FFFFFF;
+    font-size: 11pt;
+    min-height: 34px;
+    min-width: 88px;
+    max-width: 88px;
+    margin: 3px 2px;
+    padding: 0px;
+    outline: none;
 }
 
-QPushButton#mute::hover {
-    background-color: #677BC4;
+QPushButton#mute:hover {
+    background-color: #5C68EE;
+    border-color: #6B76F0;
 }
 
-QPushButton#mute::pressed {
-    background-color: #5B6EAE;
+QPushButton#mute:pressed {
+    background-color: #4550D4;
+    border-color: #4550D4;
 }
 
-QLabel#label {
-    font: 11pt "Roboto";
-    color: #8E9297;
+QPushButton#mute:focus {
+    background-color: #5C68EE;
+    border-color: #A9B0F7;
 }
+
+QPushButton#mute:disabled {
+    background-color: #333A5C;
+    border-color: #333A5C;
+    color: #8A90A8;
+}
+
+
+/* --- add-connection button ----------------------------------------------- */
+
+QPushButton#connection_btn {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #43B581;
+    font-size: 15pt;
+    min-height: 34px;
+    max-height: 34px;
+    min-width: 34px;
+    max-width: 34px;
+    margin: 3px 2px;
+    padding: 0px;
+    outline: none;
+}
+
+QPushButton#connection_btn:hover {
+    background-color: #212429;
+    border-color: #43B581;
+    color: #4FC48D;
+}
+
+QPushButton#connection_btn:pressed {
+    background-color: #17191C;
+    border-color: #38976C;
+    color: #38976C;
+}
+
+QPushButton#connection_btn:focus {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+QPushButton#connection_btn:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #3B584B;
+}
+
+
+/* --- generic push buttons (fallback for anything unnamed) ---------------- */
+
+QPushButton {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    min-height: 34px;
+    padding: 0px 16px;
+    outline: none;
+}
+
+QPushButton:hover {
+    background-color: #212429;
+    border-color: #4E545F;
+}
+
+QPushButton:pressed {
+    background-color: #17191C;
+}
+
+QPushButton:focus {
+    border-color: #6B76F0;
+}
+
+QPushButton:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+
+/* --- loading spinner inside the mute button ------------------------------ */
 
 QSvgWidget {
     background-color: transparent;
+    border: none;
     max-width: 18px;
     max-height: 18px;
 }
 
-QPushButton#connection_btn {
-    border: solid #282A2F;
-    border-width: 1px;
-    border-radius: 2px;
-    background-color: #36393F;
-    font: 16pt "Roboto";
-    color: #43B581;
-    min-height: 30px;
-    min-width: 30px;
-    max-width: 30px;
-}
 
-QPushButton#connection_btn::hover {
-    background-color: #2A2C30;
-}
+/* --- tooltips ------------------------------------------------------------ */
 
-QPushButton#connection_btn::pressed {
-    background-color: #26272B;
+QToolTip {
+    background-color: #131417;
+    border: 1px solid #383C44;
+    border-radius: 6px;
+    color: #E8EAED;
+    font-size: 10pt;
+    padding: 6px 8px;
 }
