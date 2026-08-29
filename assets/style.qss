@@ -42,6 +42,24 @@
 
    Qt Style Sheets support no transitions, shadows, transforms or variables —
    depth is done with flat layered surfaces and hairline borders only.
+
+   Type
+   ----
+   assets/ ships Roboto Regular (400), Medium (500) and Black (900), all
+   registered under the single family "Roboto", so weight is selected here
+   with font-weight alone.
+
+   Body text is 400. Emphasis is 500 and nothing else — the identity line,
+   the column headers, the mute button and the status word. Black is
+   bundled so the family has a full range, but the sheet does not reach for
+   it: at 10–12pt on a dark ground a 900 weight blooms and, more to the
+   point, when everything shouts nothing is emphasised. Medium is the whole
+   distance needed to lift a label off body text at these sizes.
+
+   Weight is stated explicitly on the base rule rather than left to
+   default. If a face fails to register, Qt snaps the request to the
+   nearest weight the family does have, so an unstated 400 is not a
+   guarantee of 400 — it is a guarantee of "whatever loaded".
    ========================================================================== */
 
 
@@ -52,6 +70,7 @@ QWidget {
     color: #E8EAED;
     font-family: "Roboto";
     font-size: 12pt;
+    font-weight: 400;
 }
 
 QMainWindow {
@@ -67,9 +86,16 @@ QLabel {
     padding: 2px 2px 8px 2px;
 }
 
+/* the identity line is the one piece of state the window asserts about
+   itself, so it carries the only emphasis in the header area */
+QLabel#info {
+    font-weight: 500;
+}
+
 QLabel#label {
     background-color: transparent;
     font-size: 10pt;
+    font-weight: 500;
     color: #9AA0A6;
     padding: 6px 2px 2px 3px;
 }
@@ -340,6 +366,7 @@ QPushButton#mute {
     border-radius: 8px;
     color: #FFFFFF;
     font-size: 11pt;
+    font-weight: 500;
     min-height: 34px;
     min-width: 88px;
     max-width: 88px;
@@ -476,8 +503,11 @@ QLabel#status_dot {
     padding: 0px 1px 2px 0px;
 }
 
+/* the one word that says whether the stream is alive; the metrics beside it
+   stay at body weight so the eye lands here first */
 QLabel#status_state {
     font-size: 10pt;
+    font-weight: 500;
     color: #9AA0A6;
 }
 

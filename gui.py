@@ -8,7 +8,13 @@ import logging_setup
 import logging
 import discord
 from PyQt6.QtSvgWidgets import QSvgWidget
-from PyQt6.QtGui import QFontDatabase, QFontMetrics, QIcon, QCursor
+from PyQt6.QtGui import (
+    QFontDatabase,
+    QFontMetrics,
+    QIcon,
+    QCursor,
+    QPalette,
+)
 from PyQt6.QtCore import Qt, QCoreApplication, QEventLoop, QDir, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -20,6 +26,10 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QLabel,
     QHBoxLayout,
+    QSizePolicy,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
     QStyledItemDelegate,
     QListView
 )
@@ -101,7 +111,35 @@ STATE_FAIL = "fail"
 
 
 class Dropdown(QComboBox):
+    """Combo box that fits its contents, within limits, and elides the rest.
+
+    The closed field shows text the user did not choose the length of --
+    device names come from PortAudio, server and channel names come from
+    whatever the guild owner typed. Sizing therefore has to satisfy three
+    things at once:
+
+    * **Fit the content when it reasonably can.** ``AdjustToContents`` makes
+      Qt measure the widest item *including* the real style chrome (frame,
+      left padding, arrow well). The hand-rolled "text width + 30" this
+      class used to rely on under-counted the stylesheet's 12px left pad
+      plus its 32px arrow well by roughly 16px, which is precisely how
+      "A pack of autism" came out clipped to "A pack of auti" on Windows.
+    * **Never let one long name drag the window off the screen.**
+      ``MAX_CHARS`` caps what the field will *ask* for.
+    * **Stay readable when it is capped or squeezed.** Anything that does
+      not fit is elided with an ellipsis and recovered through the tooltip,
+      so a clipped name is still discoverable rather than silently lost.
+    """
+
     changed = pyqtSignal(object, object)
+
+    #: Width caps for the closed field, in "average character" widths of the
+    #: current font. MAX_CHARS bounds what the field asks for; MIN_CHARS is
+    #: the floor the layout may compress it to if the window cannot be given
+    #: its full hint, so a cramped window degrades into more elision rather
+    #: than into a horizontal scroll or an off-screen mute button.
+    MAX_CHARS = 20
+    MIN_CHARS = 9
 
     def __init__(self):
         super(Dropdown, self).__init__()
@@ -110,8 +148,106 @@ class Dropdown(QComboBox):
         self.setPlaceholderText("None")
         self.setView(QListView())
 
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+
         self.deselected = None
         self.currentIndexChanged.connect(self.changed_signal)
+        self.currentIndexChanged.connect(lambda _: self.sync_tooltip())
+
+    # -- sizing ------------------------------------------------------------
+
+    def chrome_width(self):
+        """Width the field needs on top of its text.
+
+        Derived rather than hard-coded: Qt's own content-based size hint
+        minus the widest item's text advance is, by definition, everything
+        that is not text -- frame, padding and arrow well -- whatever the
+        active stylesheet has set those to.
+        """
+        metrics = QFontMetrics(self.font())
+        widest = 0
+
+        for i in range(self.count()):
+            widest = max(widest, metrics.horizontalAdvance(self.itemText(i)))
+
+        return max(0, super().sizeHint().width() - widest)
+
+    def width_for(self, chars):
+        metrics = QFontMetrics(self.font())
+        return self.chrome_width() + metrics.averageCharWidth() * chars
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setWidth(min(hint.width(), self.width_for(self.MAX_CHARS)))
+        return hint
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(hint.width(), self.width_for(self.MIN_CHARS)))
+        return hint
+
+    # -- elision -----------------------------------------------------------
+
+    def field_width(self):
+        """Pixels available for the current item's text, arrow excluded."""
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+
+        return self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        ).width()
+
+    def sync_tooltip(self):
+        """Expose the full text through the tooltip iff it is being elided."""
+        text = self.currentText()
+        available = self.field_width()
+
+        if not text or available <= 0:
+            self.setToolTip("")
+            return
+
+        metrics = QFontMetrics(self.font())
+        self.setToolTip(
+            text if metrics.horizontalAdvance(text) > available else ""
+        )
+
+    def refresh(self):
+        """Re-measure after the item list changed."""
+        self.updateGeometry()
+        self.sync_tooltip()
+
+    def resizeEvent(self, event):
+        # The tooltip depends on how much room the layout actually granted,
+        # which is only known once the widget has been given its geometry.
+        super().resizeEvent(event)
+        self.sync_tooltip()
+
+    def paintEvent(self, event):
+        # Mirrors QComboBox::paintEvent, with the label text elided to the
+        # edit field before it is drawn. Qt's own implementation clips
+        # instead, which is what produced a name cut mid-word with no
+        # ellipsis to signal that anything was missing.
+        painter = QStylePainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.Text))
+
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        painter.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, option)
+
+        available = self.field_width()
+        if available > 0:
+            metrics = QFontMetrics(self.font())
+            option.currentText = metrics.elidedText(
+                option.currentText, Qt.TextElideMode.ElideRight, available
+            )
+
+        painter.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, option)
 
     def changed_signal(self, selected):
         self.changed.emit(self.deselected, selected)
@@ -151,8 +287,12 @@ class Connection:
         self.servers = Dropdown()
         self.channels = Dropdown()
 
+        # No trailing-space padding on the label: it existed only to bully a
+        # bit of extra width out of a combo box that was not measuring its
+        # own contents. Dropdown does that properly now, and the padding
+        # skewed the measurement it feeds.
         for device, idx in parent.devices.items():
-            self.devices.addItem(device + "   ", idx)
+            self.devices.addItem(device, idx)
 
         # mute
         self.mute = SVGButton("Mute")
@@ -179,16 +319,34 @@ class Connection:
 
     @staticmethod
     def resize_combobox(combobox):
-        font = combobox.property("font")
-        metrics = QFontMetrics(font)
-        min_width = 0
+        """Tell a dropdown its item list changed so it can re-measure.
 
-        for i in range(combobox.count()):
-            size = metrics.horizontalAdvance(combobox.itemText(i))
-            if size > min_width:
-                min_width = size
+        This used to compute a minimum width by hand as "widest item + 30px"
+        and pin it with setMinimumWidth(). That was wrong twice over: 30px
+        does not cover the stylesheet's 12px left pad plus 32px arrow well,
+        so long names were clipped; and a hard minimum width meant a long
+        name could push the window wider without limit -- and could never
+        let it back down again.
 
-        combobox.setMinimumWidth(min_width + 30)
+        Dropdown owns the width policy now, but something still has to make
+        the window act on it: the server list arrives after the window has
+        already been shown and sized, and a size *hint* alone does not
+        resize a window that already has a size. So grow the window to its
+        hint here, which the old minimum width did implicitly.
+
+        Growing only, never shrinking, so switching to a shorter server name
+        does not make the window jump about mid-session. It stays bounded
+        because Dropdown caps every column's hint.
+        """
+        combobox.refresh()
+
+        window = combobox.window()
+        if window is None:
+            return
+
+        hint = window.sizeHint().width()
+        if hint > window.width():
+            window.resize(hint, window.height())
 
     def setEnabled(self, enabled):
         self.devices.setEnabled(enabled)
@@ -621,14 +779,29 @@ class GUI(QMainWindow):
         self.layout.setContentsMargins(20, 16, 20, 20)
         central.setLayout(self.layout)
 
+        # Deliberately no column stretch factors.
+        #
+        # QGridLayout has two distribution modes. With stretch factors set it
+        # divides the whole width in the stretch ratio, so three equally
+        # weighted dropdown columns come out the same width whatever they
+        # contain -- Channels sitting on 70px of slack showing "General"
+        # while Devices elides a 31-character name. With no stretch factors
+        # it gives every column its size hint first and shares only the
+        # surplus, which is what we want: each column ends up as wide as its
+        # own content needs, up to Dropdown's cap.
+        #
+        # This works because the window is frameless and has no resize grip,
+        # so it is only ever at the width resize_combobox() gave it -- there
+        # is essentially no surplus to argue over.
+
         # labels
         self.info = QLabel("Connecting...")
         self.info.setObjectName("info")
         device_lb = QLabel("Devices")
         device_lb.setObjectName("label")
-        server_lb = QLabel("Servers     ")
+        server_lb = QLabel("Servers")
         server_lb.setObjectName("label")
-        channel_lb = QLabel("Channels  ")
+        channel_lb = QLabel("Channels")
         channel_lb.setObjectName("label")
 
         # connections
@@ -662,8 +835,32 @@ class GUI(QMainWindow):
         self.setCentralWidget(central)
         self.setEnabled(False)
 
+        # load fonts
+        #
+        # Absolute paths, deliberately. QFontDatabase.addApplicationFont()
+        # silently returns -1 for a relative path on macOS even with
+        # QDir.setCurrent() pointing at the bundle, so the app fell back to
+        # the platform UI font there while loading correctly on Windows.
+        # That platform split is exactly what hid the weight problem below:
+        # the development machine never rendered the bundled face at all.
+        #
+        # All three faces carry typographic family "Roboto" with styles
+        # Regular / Medium / Black, so they register as one family and the
+        # stylesheet picks between them with font-weight alone. Registering
+        # only Roboto-Black.ttf, as this did before, left 900 as the
+        # family's only face, and every weight request -- including the
+        # default 400 -- snapped to it. That is why the Windows build came
+        # out uniformly heavy.
+        #
+        # A face that fails to load is not fatal (Qt substitutes), but it is
+        # never silent again.
+        for face in ("Roboto-Regular.ttf", "Roboto-Medium.ttf", "Roboto-Black.ttf"):
+            path = os.path.join(bundle_dir, "assets", face)
+
+            if QFontDatabase.addApplicationFont(path) == -1:
+                logging.warning("could not load bundled font: %s", path)
+
         # load styles
-        QFontDatabase.addApplicationFont("./assets/Roboto-Black.ttf")
         with open("./assets/style.qss", "r") as qss:
             self.app.setStyleSheet(qss.read())
 
