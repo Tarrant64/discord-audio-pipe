@@ -116,11 +116,48 @@ saves the preference and nothing else; a stalled stream still needs a manual
 reconnect. Automatic recovery is a separate change, deliberately held back
 until the strip has told us which metric moves first.
 
+### Auto-connect checkbox
+
+**Off by default.** Your last-used setup is saved and pre-filled into the
+dropdowns whether this is ticked or not — the checkbox only controls whether
+the app turns that restored selection into an actual voice connection on
+launch, without being asked. Joining is audible to everyone in the channel,
+so it is opt-in.
+
+## Remembering your last setup
+
+Whenever you change a dropdown, the app records that row's audio device,
+server, channel and mute state in `DAP_config.json`, and restores them the
+next time it starts. Multiple connection rows (the `＋` button) are all
+saved, in order.
+
+Two details are worth knowing:
+
+**The audio device is remembered by name, not by number.** PortAudio hands
+out device indices in enumeration order, and that order changes when you
+plug in a headset, update a driver, or sometimes just reboot. Storing the
+index would eventually select a *different* device — and the next thing the
+app does with a device is stream it into a voice channel, so that could mean
+broadcasting a live microphone. The name is matched exactly, or not at all:
+if the saved device is not present, the row starts blank and says so in
+`DAP_session.log`. It is never resolved to a nearby device.
+
+**Servers and channels are remembered by id.** Those ids are stable, so a
+renamed channel is still found. A channel that was deleted, or that the bot
+can no longer see, is not — the row keeps whatever still resolves, leaves
+the rest blank, and logs one line saying which part was dropped and why.
+
+Restoring happens in two phases, because the server list does not exist
+until the bot has finished logging in: devices are restored immediately, and
+servers/channels once the client is ready.
+
 ## Settings file
 
 `DAP_config.json` is written next to `main.pyw` / the `.exe`, alongside
-`token.txt`. It currently holds the one `auto_recover` preference and is
-created the first time a setting changes.
+`token.txt`. It holds the `auto_recover` and `auto_connect` preferences and
+the saved `profile` rows, and is **created with defaults on first launch**,
+so it is there to find and hand-edit even if you have never changed a
+setting.
 
 It is written atomically (temp file plus rename), so a crash mid-save cannot
 corrupt it. A missing, unreadable or malformed file is not an error: the
@@ -129,6 +166,37 @@ the build does not recognise are preserved rather than discarded, so the
 file survives moving between versions. **The bot token is never stored
 there** — it lives in `token.txt` and nowhere else, and a token key
 hand-added to the settings file is ignored and stripped on the next write.
+That check is recursive: because profile rows are nested objects, a secret
+buried inside a container is rejected too, and each row is rebuilt from a
+fixed field whitelist rather than round-tripped.
+
+`DAP_config.json` is listed in `.gitignore` and must stay there.
+
+## Crash safety: exceptions in Qt slots
+
+Under PyQt5, an exception escaping a Python slot back into Qt was printed
+and the app carried on. **PyQt6 calls `qFatal()` instead**, which aborts the
+process immediately — no Python traceback, nothing flushed to any log file,
+just a native "Abort trap: 6". The PyQt5 → PyQt6 migration therefore turned
+every unguarded slot into a potential silent crash.
+
+PyQt makes one exception: if `sys.excepthook` has been replaced, it hands
+the exception to the replacement instead of aborting. `main.pyw` installs
+such a hook (`logging_setup.install_excepthook`) before PyQt is imported. It
+logs the traceback to `DAP_errors.log`, notes the event in
+`DAP_session.log`, and returns, so the app survives.
+
+Measured, with a slot raising `RuntimeError` from `setCurrentIndex()`:
+
+| `sys.excepthook` | outcome |
+|---|---|
+| default | exit 134 (SIGABRT), slot never returns |
+| replaced | exit 0, hook runs, execution continues |
+
+The hook is the net, not the plan: slot bodies still catch their own
+exceptions. Anything reachable from a signal — including the profile
+restore, which drives `setCurrentIndex()` on devices, servers and channels
+that may all have disappeared — must not let an exception escape.
 
 ## Logging and diagnostics
 
@@ -138,8 +206,16 @@ keep 3 backups, so they can no longer grow without bound.
 | File | When | Contents |
 |---|---|---|
 | `DAP_errors.log` | always | ERROR and above; unhandled exceptions from the app. |
-| `DAP_session.log` | always | INFO lifecycle trail: start (with versions and redacted args), device selection, channel joins, disconnects, shutdown. Also carries a handful of discord.py voice diagnostics promoted from DEBUG to WARNING — most importantly `Aborting playback`, which discord.py emits immediately before it silently abandons the audio player thread. |
+| `DAP_session.log` | always | INFO lifecycle trail: start (with versions and redacted args), device selection, channel joins, disconnects, profile restore decisions, shutdown. Also carries a handful of discord.py voice diagnostics promoted from DEBUG to WARNING — most importantly `Aborting playback`, which discord.py emits immediately before it silently abandons the audio player thread. |
 | `discord.log` | `-v` only | Full DEBUG firehose from the `discord` logger. |
+
+Every `DAP_session.log` line carries the writing process's pid
+(`… pid=12345 INFO …`). The file is opened by path in the working
+directory, so two builds launched from the same folder — exactly what
+happens when testing a new `.exe` next to the old one — append to the same
+file and interleave. Without the pid, a stall recorded there cannot be
+attributed to a process, which makes the log unable to answer the question
+it exists for.
 
 Bot tokens are never written to any log file; `-t` / `--token` values are
 redacted.

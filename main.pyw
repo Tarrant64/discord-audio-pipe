@@ -5,6 +5,12 @@ import logging_setup
 # import-time failures still reach DAP_errors.log)
 logging_setup.configure()
 
+# Safety net for exceptions that escape a Qt slot. Installed here, before
+# PyQt is imported and long before any widget exists, because PyQt6 turns
+# such an exception into abort() unless sys.excepthook has been replaced --
+# see logging_setup.install_excepthook() for the measurements.
+logging_setup.install_excepthook()
+
 import sys
 import cli
 import sound

@@ -540,9 +540,13 @@ QLabel#status_state[state="idle"] {
 }
 
 
-/* --- auto-recover checkbox ----------------------------------------------- */
+/* --- status-strip toggles ------------------------------------------------ */
+/* Keyed on the dynamic property role="toggle", not on an object name, so the
+   strip's checkboxes (auto-connect, auto-recover) share one rule set and a
+   third one needs no CSS at all. Qt resolves dynamic-property selectors at
+   stylesheet-apply time, and StatusStrip is built before setStyleSheet(). */
 
-QCheckBox#autorecover {
+QCheckBox[role="toggle"] {
     background-color: transparent;
     color: #9AA0A6;
     font-size: 10pt;
@@ -551,11 +555,11 @@ QCheckBox#autorecover {
     outline: none;
 }
 
-QCheckBox#autorecover:hover {
+QCheckBox[role="toggle"]:hover {
     color: #E8EAED;
 }
 
-QCheckBox#autorecover::indicator {
+QCheckBox[role="toggle"]::indicator {
     background-color: #24262C;
     border: 1px solid #4E545F;
     border-radius: 4px;
@@ -563,27 +567,27 @@ QCheckBox#autorecover::indicator {
     height: 14px;
 }
 
-QCheckBox#autorecover::indicator:hover {
+QCheckBox[role="toggle"]::indicator:hover {
     border-color: #6B76F0;
 }
 
 /* No image: the checked state is a filled accent square. An SVG tick would
    need a second asset and would not recolour with the theme. */
-QCheckBox#autorecover::indicator:checked {
+QCheckBox[role="toggle"]::indicator:checked {
     background-color: #5561E8;
     border-color: #5561E8;
 }
 
-QCheckBox#autorecover::indicator:checked:hover {
+QCheckBox[role="toggle"]::indicator:checked:hover {
     background-color: #5C68EE;
     border-color: #6B76F0;
 }
 
-QCheckBox#autorecover:focus {
+QCheckBox[role="toggle"]:focus {
     color: #E8EAED;
 }
 
-QCheckBox#autorecover:focus::indicator {
+QCheckBox[role="toggle"]:focus::indicator {
     border-color: #6B76F0;
 }
 

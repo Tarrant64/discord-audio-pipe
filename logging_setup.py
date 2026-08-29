@@ -13,8 +13,11 @@ Three log files:
                    behaviour, now size-bounded.
   DAP_session.log  NEW. INFO-level lifecycle log: start/stop, device
                    selection, guild/channel joins, connects, disconnects,
-                   the ``--diagnose`` instrumentation output, plus the
-                   *promoted* discord.py diagnostics described below.
+                   settings/profile changes, the ``--diagnose``
+                   instrumentation output, plus the *promoted* discord.py
+                   diagnostics described below. Every line carries the
+                   writing process's pid, because two builds launched from
+                   the same directory share this file.
 
 The promotion filter is the highest-value piece here. discord.py logs its
 two most diagnostic voice lines at DEBUG:
@@ -163,8 +166,16 @@ def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None):
         # ONE handler instance, shared by the ``dap`` logger and the discord
         # voice loggers. Two RotatingFileHandlers on the same path would race
         # each other during rollover, so this must stay a single object.
+        # ``pid=`` is not decoration. DAP_session.log is opened by path, in
+        # the working directory, with no per-process suffix, so two copies
+        # launched from the same folder -- which is exactly what happens
+        # while testing a new build next to the old one -- append to the same
+        # file and interleave. Without the pid, a stall recorded in that file
+        # cannot be attributed to a process, and the "which build did this?"
+        # question the log exists to answer becomes unanswerable.
         session_formatter = logging.Formatter(
-            fmt="%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s",
+            fmt="%(asctime)s.%(msecs)03d pid=%(process)-6d %(levelname)-7s"
+                " [%(name)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
         session_handler = PromotingHandler(
@@ -194,6 +205,78 @@ def configure(verbose=False, log_dir=None, max_bytes=None, backup_count=None):
         _configured = True
 
     return get_logger()
+
+
+# ---------------------------------------------------------------------------
+# unhandled-exception safety net
+# ---------------------------------------------------------------------------
+
+_excepthook_installed = False
+
+
+def install_excepthook():
+    """Stop an unhandled exception in a Qt slot from killing the process.
+
+    This is not belt-and-braces. It is load-bearing, and it is a regression
+    the PyQt5 -> PyQt6 migration introduced.
+
+    Under PyQt5, an exception that escaped a Python slot back into C++ was
+    printed and execution continued. PyQt6 calls ``qFatal()`` instead, which
+    calls ``abort()``: the whole application dies instantly, with a native
+    "Abort trap: 6" crash report and *nothing at all* in DAP_errors.log,
+    because the process is gone before anything can be flushed.
+
+    PyQt makes exactly one exception to that: if ``sys.excepthook`` has been
+    replaced, it hands the exception to the replacement and does **not**
+    abort. So installing any non-default hook is what keeps the app alive.
+
+    Measured, not assumed -- a slot raising RuntimeError, triggered by
+    ``QComboBox.setCurrentIndex()``:
+
+        default sys.excepthook  -> exit 134 (SIGABRT), slot never returns
+        replaced sys.excepthook -> exit 0, hook runs, execution continues
+
+    This matters most for anything that sets a widget's value in code rather
+    than in response to a click -- the saved-profile restore, above all. A
+    restore touches a device that may have been unplugged, a guild the bot
+    may have been removed from and a channel that may have been deleted, and
+    every one of those paths runs inside a slot.
+
+    Individual slot bodies still catch their own exceptions; this is the net
+    under the ones we missed. Only covers the main thread -- worker threads
+    go through ``threading.excepthook``, which is untouched.
+    """
+    global _excepthook_installed
+
+    with _lock:
+        if _excepthook_installed:
+            return
+
+        previous = sys.excepthook
+
+        def handler(exc_type, value, traceback_obj):
+            try:
+                logging.getLogger("dap").error(
+                    "unhandled exception (%s) -- caught by the safety net,"
+                    " continuing; see DAP_errors.log for the traceback",
+                    exc_type.__name__,
+                )
+                logging.getLogger().error(
+                    "unhandled exception",
+                    exc_info=(exc_type, value, traceback_obj),
+                )
+            except Exception:
+                # Logging itself failed. Fall back to stderr; never re-raise
+                # out of an excepthook.
+                pass
+
+            try:
+                previous(exc_type, value, traceback_obj)
+            except Exception:
+                pass
+
+        sys.excepthook = handler
+        _excepthook_installed = True
 
 
 _verbose_enabled = False
