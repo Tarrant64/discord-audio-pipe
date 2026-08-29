@@ -1,20 +1,21 @@
 import logging
+import logging_setup
 
-# error logging
-error_formatter = logging.Formatter(
-    fmt="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
+# error logging (installed before any other import, as upstream did, so that
+# import-time failures still reach DAP_errors.log)
+logging_setup.configure()
 
-error_handler = logging.FileHandler("DAP_errors.log", delay=True)
-error_handler.setLevel(logging.ERROR)
-error_handler.setFormatter(error_formatter)
-
-base_logger = logging.getLogger()
-base_logger.addHandler(error_handler)
+# Capture the traceback of any exception that escapes a Qt slot, so a crash
+# leaves something readable in DAP_errors.log instead of only a native
+# "Abort trap: 6". This RECORDS crashes; it does not prevent them -- PyQt6
+# may call qFatal() regardless of what the hook does. Prevention is
+# gui.guarded_slot. See logging_setup.install_excepthook() for measurements.
+logging_setup.install_excepthook()
 
 import sys
 import cli
 import sound
+import instrumentation
 import asyncio
 import discord
 import argparse
@@ -38,7 +39,17 @@ parser.add_argument(
     "--verbose",
     dest="verbose",
     action="store_true",
-    help="Enable verbose logging",
+    help="Echo logs to the console and enable DEBUG for DAP's own logger."
+         " discord.log is written either way.",
+)
+
+parser.add_argument(
+    "--diagnose",
+    dest="diagnose",
+    action="store_true",
+    help="Log verbose audio/voice-state diagnostics every 5s to"
+         " DAP_session.log. The metrics themselves are always collected and"
+         " shown in the status strip; this only controls the logging.",
 )
 
 connect.add_argument(
@@ -78,29 +89,25 @@ query.add_argument(
 args = parser.parse_args()
 is_gui = not any([args.channel, args.device, args.query, args.online])
 
-# verbose logs
+# verbose logs (discord.log is written regardless now; -v adds console
+# echo and lowers the dap namespace to DEBUG -- see logging_setup)
 if args.verbose:
-    debug_formatter = logging.Formatter(
-        fmt="%(asctime)s:%(levelname)s:%(name)s: %(message)s"
-    )
+    logging_setup.enable_verbose()
 
-    debug_handler = logging.FileHandler(
-        filename="discord.log", encoding="utf-8", mode="w"
-    )
-    debug_handler.setFormatter(debug_formatter)
+# diagnostics
+if args.diagnose:
+    instrumentation.enable()
 
-    debug_logger = logging.getLogger("discord")
-    debug_logger.setLevel(logging.DEBUG)
-    debug_logger.addHandler(debug_handler)
+logging_setup.log_start(args, diagnose=args.diagnose)
 
 # don't import qt stuff if not using gui
 if is_gui:
     import gui
-    from PyQt5.QtWidgets import QApplication, QMessageBox
+    from PyQt6.QtWidgets import QApplication, QMessageBox
 
     app = QApplication(sys.argv)
     msg = QMessageBox()
-    msg.setIcon(QMessageBox.Information)
+    msg.setIcon(QMessageBox.Icon.Information)
 
 # main
 async def main(bot):
@@ -135,7 +142,8 @@ async def main(bot):
 
         await bot.start(token)
 
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        logging_setup.note_shutdown("no-token-file", exc=exc)
         if is_gui:
             msg.setWindowTitle("Token Error")
             msg.setText("No Token Provided")
@@ -144,7 +152,8 @@ async def main(bot):
         else:
             print("No Token Provided")
 
-    except discord.errors.LoginFailure:
+    except discord.errors.LoginFailure as exc:
+        logging_setup.note_shutdown("discord-login-failed", exc=exc)
         if is_gui:
             msg.setWindowTitle("Login Failed")
             msg.setText("Please check if the token is correct")
@@ -153,7 +162,8 @@ async def main(bot):
         else:
             print("Login Failed: Please check if the token is correct")
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        logging_setup.note_shutdown("asyncio-cancelled", exc=exc)
         if is_gui:
             bot_ui.close()
 
@@ -161,12 +171,25 @@ async def main(bot):
         await asyncio.sleep(1)
         raise
 
-    except Exception:
+    except Exception as exc:
+        logging_setup.note_shutdown("error-in-main", exc=exc)
         logging.exception("Error on main")
 
 bot = discord.Client(intents=discord.Intents.default())
 
 try:
     asyncio.run(main(bot))
-except KeyboardInterrupt:
+except KeyboardInterrupt as exc:
+    logging_setup.note_shutdown("keyboard-interrupt", exc=exc)
     print("Exiting...")
+except BaseException as exc:
+    # Attribute it, then let it propagate exactly as before -- the installed
+    # excepthook still writes the traceback to DAP_errors.log.
+    logging_setup.note_shutdown(exc=exc)
+    raise
+else:
+    # asyncio.run() returned without raising, i.e. bot.start() came back.
+    # First-writer-wins means a GUI close already recorded itself here.
+    logging_setup.note_shutdown("discord-client-exit")
+finally:
+    logging_setup.log_shutdown()

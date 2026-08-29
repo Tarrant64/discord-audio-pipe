@@ -1,42 +1,163 @@
 name: CI
 
+# Three triggers:
+#   * push to feature/** - GitHub only shows the workflow_dispatch "Run workflow"
+#     button for workflows that exist on the DEFAULT branch. This workflow lives on
+#     a feature branch, so without a push trigger the branch would never build.
+#   * workflow_dispatch - build both legs on demand from the Actions tab.
+#   * release (prereleased) - original behaviour: build and attach the exe to the
+#     prerelease as an asset.
 on:
+  push:
+    branches: [ 'feature/**' ]
+  workflow_dispatch:
   release:
     types: [prereleased]
 
+# Cancel superseded runs instead of paying for them: this is a private repo and
+# windows-latest bills at a 2x minute multiplier.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Needed only by the release-asset upload step, which uses the auto-provided
+# GITHUB_TOKEN. No other secrets are used anywhere in this workflow, and a Discord
+# token must never be added to CI.
+permissions:
+  contents: write
+
 jobs:
   build:
+    name: build (${{ matrix.leg }})
     runs-on: windows-latest
 
+    strategy:
+      # One leg failing must still produce the other leg's artifact - the whole point
+      # of the baseline leg is to have a control when the modern leg misbehaves.
+      fail-fast: false
+      matrix:
+        include:
+          # Modernized build: Python 3.12 / PyInstaller 6.x / PyQt6.
+          - leg: modern
+            python_version: '3.12'
+            pyinstaller: 'pyinstaller==6.22.2'
+            # PyInstaller 6.x does not import pkg_resources, so this leg tracks
+            # current setuptools. Do not pin it - the modern leg is what proves the
+            # app builds against today's toolchain.
+            setuptools: 'setuptools'
+            requirements: 'build/requirements.txt'
+            spec: './build/main.spec'
+            source_ref: ''
+            artifact: 'dap-modern-win64'
+            asset_suffix: ''
+
+          # Control build: the exact pre-modernization toolchain, pins, spec AND
+          # application sources. source_ref is the last upstream commit before the
+          # PyQt6 migration; it is checked back out over the working tree so the
+          # PyQt5 sources are what actually gets frozen.
+          - leg: baseline
+            python_version: '3.10'
+            pyinstaller: 'pyinstaller==5.1'
+            # PyInstaller 5.1 does `import pkg_resources` at the top of its own
+            # __init__.py. setuptools 82.0.0 (released 2026-02-08) REMOVED the
+            # pkg_resources module outright - "pkg_resources has been removed from
+            # Setuptools" (setuptools changelog v82.0.0, pypa/setuptools#3085) - so an
+            # unpinned `pip install --upgrade setuptools` breaks this leg with
+            # `ModuleNotFoundError: No module named 'pkg_resources'` before PyInstaller
+            # can even print its version. 81.x is the last series that still ships it.
+            #
+            # The fix belongs HERE and not on the PyInstaller pin: the entire purpose
+            # of this leg is to reproduce the original toolchain as a control, so
+            # bumping it to PyInstaller 6.x would delete the thing being measured.
+            setuptools: 'setuptools<82'
+            requirements: 'build/requirements-baseline.txt'
+            spec: './build/main-baseline.spec'
+            source_ref: 'b9ea7bf'
+            artifact: 'dap-baseline-win64'
+            asset_suffix: '-baseline'
+
     steps:
-    - uses: actions/checkout@v2
-      with:
-        fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the baseline leg can check out the pre-modernization
+          # application sources by commit.
+          fetch-depth: 0
 
-    - uses: actions/setup-python@v3
-      with:
-        python-version: '3.10'
-        architecture: 'x64'
+      - name: Restore pre-modernization application sources
+        if: matrix.source_ref != ''
+        run: |
+          git checkout ${{ matrix.source_ref }} -- main.pyw gui.py sound.py cli.py assets
+          git --no-pager diff --stat HEAD -- main.pyw gui.py sound.py cli.py assets
 
-    - name: Set release name
-      run: |
-        $RELEASE = cat $Env:GITHUB_EVENT_PATH | jq --raw-output .release.id
-        echo "releaseID=$RELEASE" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf-8 -Append
-        echo "fileName=dap-${{ github.event.release.tag_name }}-win64" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf-8 -Append
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_version }}
+          architecture: 'x64'
 
-    - name: Install python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pyinstaller==5.1
-        pip install -r build/requirements.txt
+      - name: Install python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "${{ matrix.setuptools }}" wheel
+          pip install ${{ matrix.pyinstaller }}
+          pip install -r ${{ matrix.requirements }}
 
-    - name: Compile to exe
-      run: |
-        pyinstaller ./build/main.spec
+      # Runs after every install, so it also catches a transitive dependency quietly
+      # dragging setuptools back up over the 82 boundary. Fails with an obvious
+      # message instead of an opaque traceback from inside PyInstaller's __init__.
+      - name: Verify pkg_resources is importable
+        if: matrix.leg == 'baseline'
+        run: |
+          python -c "import setuptools; print('setuptools', setuptools.__version__)"
+          python -c "import pkg_resources; print('pkg_resources OK ->', pkg_resources.__file__)"
 
-    - name: Release
-      run: | 
-        $uploadPath = "./dist/dap.exe"
-        $uri = "https://uploads.github.com/repos/$Env:GITHUB_REPOSITORY/releases/${{ env.releaseID }}/assets?name=${{ env.fileName }}.exe"
-        $headers = @{"Content-Type"="application/x-msdownload"; "Authorization"="token ${{ secrets.GITHUB_TOKEN }}"}
-        Invoke-WebRequest -Uri $uri -Method POST -Header $headers -InFile $uploadPath
+      - name: Report resolved toolchain and dependency versions
+        run: |
+          python --version
+          pip --version
+          pyinstaller --version
+          echo "----- pip freeze -----"
+          pip freeze
+
+      - name: Compile to exe
+        # Consumed by build/version_info.py, which build/main.spec loads to produce
+        # the Windows version resource. The baseline spec ignores these entirely -
+        # it stays a faithful control with no version resource. Every one of them is
+        # optional: version_info.py falls back to a static default if any is missing
+        # or unparseable, so a build can never fail on version derivation.
+        env:
+          DAP_BUILD_NUMBER: ${{ github.run_number }}
+          DAP_GIT_SHA: ${{ github.sha }}
+          DAP_GIT_REF: ${{ github.ref_name }}
+        run: pyinstaller ${{ matrix.spec }}
+
+      - name: Report build output
+        run: |
+          Get-ChildItem -Path ./dist | Select-Object Name, Length, LastWriteTime | Format-Table -AutoSize
+
+      - name: Report embedded version resource
+        if: matrix.leg == 'modern'
+        run: |
+          $info = (Get-Item ./dist/dap.exe).VersionInfo
+          $info | Format-List FileVersion, ProductVersion, FileDescription, ProductName, OriginalFilename, LegalCopyright, Comments
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/dap.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach exe to release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $uploadPath = "./dist/dap.exe"
+          $fileName = "dap-${{ github.event.release.tag_name }}-win64${{ matrix.asset_suffix }}"
+          $uri = "https://uploads.github.com/repos/$Env:GITHUB_REPOSITORY/releases/${{ github.event.release.id }}/assets?name=$fileName.exe"
+          $headers = @{
+            "Content-Type"  = "application/x-msdownload"
+            "Authorization" = "token $Env:GITHUB_TOKEN"
+          }
+          Invoke-WebRequest -Uri $uri -Method POST -Headers $headers -InFile $uploadPath

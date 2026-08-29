@@ -1,6 +1,7 @@
 import sys
 import sound
 import logging
+import instrumentation
 import discord
 
 
@@ -10,12 +11,13 @@ async def connect(bot, device_id, channel_id):
         await bot.wait_until_ready()
         print(f"Logged in as {bot.user.name}")
 
-        stream = sound.PCMStream()
+        stream = instrumentation.make_stream()
         channel = bot.get_channel(channel_id)
         stream.change_device(device_id)
 
         voice = await channel.connect()
-        voice.play(stream)
+        instrumentation.attach(voice, f" [{channel}]")
+        voice.play(stream, after=instrumentation.make_after(f" [{channel}]"))
 
         print(f"Playing audio in {channel.name}")
 

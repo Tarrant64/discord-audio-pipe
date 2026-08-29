@@ -1,8 +1,14 @@
 __pycache__/
 token.txt
+DAP_config.json
 *.exe
 *.log
 *.dll
 main.py
 build/main
 .vscode
+venv/
+.venv/
+*.pyc
+build/dist/
+dist/

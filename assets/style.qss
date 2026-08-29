@@ -1,120 +1,824 @@
+/* ==========================================================================
+   Discord Audio Pipe — dark theme
+   --------------------------------------------------------------------------
+   Palette (hex is repeated inline; Qt Style Sheets have no variables)
+
+     titlebar chrome   #131417
+     window / panel    #24262C
+     control "well"    #1B1D21   (inputs sit below the panel, not above it)
+     control hover     #212429
+     control pressed   #17191C
+     popup surface     #202329
+     hairline border   #383C44   hover #4E545F
+     focus ring        #6B76F0
+     primary text      #E8EAED   muted #9AA0A6   titlebar #A8ADB5
+     accent (mute)     #5561E8   hover #5C68EE   pressed #4550D4
+     add / success     #43B581
+     danger (close)    #D83C3E
+     status healthy    #43B581   degrading #E9A23C   failing #F87171
+     status idle       #9AA0A6
+     on-air fill       #2E7D5B   hover #35845F   pressed #286B4E
+     muted fill        #E9A23C   hover #F0AE50   pressed #D08F2E
+
+   Contrast (WCAG 2.1, computed):
+     #E8EAED on #24262C panel ....... 12.6:1
+     #E8EAED on #1B1D21 control ..... 14.0:1
+     #9AA0A6 muted labels on panel ... 5.7:1
+     #A8ADB5 on #131417 titlebar ..... 8.2:1
+     white on #5561E8 accent ......... 4.9:1  (hover 4.5:1)
+     white on #D83C3E close hover .... 4.5:1
+     #43B581 add glyph on control .... 5.7:1
+     #6B76F0 focus ring vs control ... 4.4:1  (non-text, needs 3:1)
+     arrow #6B6D72 vs control ........ 3.3:1  (non-text, needs 3:1)
+
+   Status strip, all on the #1B1D21 well:
+     #43B581 healthy ................. 6.6:1
+     #E9A23C degrading ............... 7.8:1
+     #F87171 failing ................. 6.1:1
+     #9AA0A6 idle / metric text ...... 6.4:1
+
+   Connect / Disconnect button, added with the connection state machine.
+   Text ratios first (all clear 4.5:1), then the non-text rings and borders
+   (which need 3:1, measured against BOTH neighbouring surfaces):
+     #E8EAED idle label on #1B1D21 ... 14.0:1
+     #43B581 idle hover on #212429 .... 6.1:1
+     #38976C idle pressed on #17191C .. 4.9:1
+     #E9A23C connecting on #1B1D21 .... 7.8:1   (also disconnecting)
+     white on #2E7D5B live fill ....... 5.0:1
+     white on #35845F live hover ...... 4.6:1
+     white on #286B4E live pressed .... 6.4:1
+     #A6C4B5 on #26493C live disabled . 5.3:1   (disabled text is exempt)
+     #F87171 failed on #1B1D21 ........ 6.1:1
+     #FCA5A5 failed hover on #212429 .. 8.2:1
+     #D85C5C failed pressed on #17191C  4.7:1
+     #A9B0F7 focus ring vs well ....... 8.2:1   vs panel 7.4:1
+     #FFFFFF live focus ring vs fill .. 5.0:1   vs panel 15.1:1
+     #43B581 live border vs panel ..... 5.9:1
+     #E9A23C busy border vs panel ..... 7.0:1
+     #F87171 failed border vs panel ... 5.5:1
+
+   Mute button, checked (= muted):
+     #131417 on #E9A23C amber fill .... 8.5:1
+     #131417 on #F0AE50 hover ......... 9.5:1
+     #131417 on #D08F2E pressed ....... 6.7:1
+     #131417 focus ring vs the fill ... 9.5:1
+     #E0D3B8 on #6B5528 disabled ...... 4.8:1   (should be unreachable)
+
+   Muted is amber, not red: it is a state the user chose and will undo. Red
+   is reserved for the two things that are actually wrong — a failed connect
+   and a failing stream.
+
+   The strip's failing colour is #F87171, not the #D83C3E used for the close
+   button: #D83C3E is only 3.7:1 as text on #1B1D21, which is fine for a
+   button fill behind white text but not for coloured text. Status is always
+   spelled out in words as well, so colour is never the only channel.
+
+   Qt Style Sheets support no transitions, shadows, transforms or variables —
+   depth is done with flat layered surfaces and hairline borders only.
+
+   Type
+   ----
+   assets/ ships Roboto Regular (400), Medium (500) and Black (900), all
+   registered under the single family "Roboto", so weight is selected here
+   with font-weight alone.
+
+   Body text is 400. Emphasis is 500 and nothing else — the identity line,
+   the column headers, the mute button and the status word. Black is
+   bundled so the family has a full range, but the sheet does not reach for
+   it: at 10–12pt on a dark ground a 900 weight blooms and, more to the
+   point, when everything shouts nothing is emphasised. Medium is the whole
+   distance needed to lift a label off body text at these sizes.
+
+   Weight is stated explicitly on the base rule rather than left to
+   default. If a face fails to register, Qt snaps the request to the
+   nearest weight the family does have, so an unstated 400 is not a
+   guarantee of 400 — it is a guarantee of "whatever loaded".
+   ========================================================================== */
+
+
+/* --- base ---------------------------------------------------------------- */
+
 QWidget {
-    background-color: #303339;
-    font: 12pt "Roboto";
-    color: white;
+    background-color: #24262C;
+    color: #E8EAED;
+    font-family: "Roboto";
+    font-size: 12pt;
+    font-weight: 400;
 }
+
+QMainWindow {
+    background-color: #24262C;
+}
+
+/* the "Logged in as: ..." status line; the labelled column headers below
+   override this via the more specific QLabel#label rule */
+QLabel {
+    background-color: transparent;
+    color: #E8EAED;
+    font-size: 11pt;
+    padding: 2px 2px 8px 2px;
+}
+
+/* the identity line is the one piece of state the window asserts about
+   itself, so it carries the only emphasis in the header area */
+QLabel#info {
+    font-weight: 500;
+}
+
+QLabel#label {
+    background-color: transparent;
+    font-size: 10pt;
+    font-weight: 500;
+    color: #9AA0A6;
+    padding: 6px 2px 2px 3px;
+}
+
+QLabel:disabled {
+    color: #63686F;
+}
+
+
+/* --- title bar ----------------------------------------------------------- */
 
 QFrame#titlebar {
-    background-color: #202225;
-}
-
-QFrame#titlebar > * {
+    background-color: #131417;
     border: none;
-    font: 10pt "Roboto";
-    background-color: #202225;
-    color: #72767D;
+    border-bottom: 1px solid #0E0F12;
 }
 
 QFrame#titlebar QLabel {
-    padding: 5px;
+    background-color: transparent;
+    border: none;
+    font-size: 10pt;
+    color: #A8ADB5;
+    padding: 7px 12px;
 }
 
 QFrame#titlebar QPushButton {
-    min-height: 25px;
-    min-width: 40px;
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
+    font-size: 11pt;
+    color: #A8ADB5;
+    min-height: 32px;
+    min-width: 44px;
+    padding: 0px;
 }
 
-QPushButton#close::hover {
-    background-color: #F04747;
+QFrame#titlebar QPushButton:hover {
+    background-color: #23252B;
+    color: #E8EAED;
 }
 
-QPushButton#minimize::hover {
-    background-color: #282B2E;
+QFrame#titlebar QPushButton:pressed {
+    background-color: #1A1C21;
 }
+
+QFrame#titlebar QPushButton:focus {
+    background-color: #23252B;
+    color: #E8EAED;
+    border-bottom: 2px solid #6B76F0;
+}
+
+QFrame#titlebar QPushButton:disabled {
+    color: #55595F;
+    background-color: transparent;
+}
+
+/* these must out-specify "QFrame#titlebar QPushButton:hover" above, hence the
+   redundant-looking descendant prefix */
+QFrame#titlebar QPushButton#close:hover {
+    background-color: #D83C3E;
+    color: #FFFFFF;
+}
+
+QFrame#titlebar QPushButton#close:pressed {
+    background-color: #B02F31;
+    color: #FFFFFF;
+}
+
+QFrame#titlebar QPushButton#close:focus {
+    background-color: #23252B;
+    color: #E8EAED;
+    border-bottom: 2px solid #D83C3E;
+}
+
+QFrame#titlebar QPushButton#minimize:hover {
+    background-color: #23252B;
+    color: #E8EAED;
+}
+
+QFrame#titlebar QPushButton#minimize:pressed {
+    background-color: #1A1C21;
+}
+
+
+/* --- dropdowns ----------------------------------------------------------- */
 
 QComboBox {
-    border: solid #282A2F;
-    border-width: 1px;
-    border-radius: 3px;
-    background-color: #303339;
-    min-height: 30px;
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    min-height: 34px;
+    padding-left: 12px;
+    padding-right: 4px;
+    outline: none;
 }
 
-QComboBox::hover {
-    border-color: black;
+QComboBox:hover {
+    background-color: #212429;
+    border-color: #4E545F;
+}
+
+QComboBox:focus {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+/* popup is open */
+QComboBox:on {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+QComboBox:pressed {
+    background-color: #17191C;
+    border-color: #6B76F0;
+}
+
+QComboBox:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
 }
 
 QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    background-color: transparent;
     border: none;
+    width: 32px;
 }
 
 QComboBox::down-arrow {
     image: url(./assets/arrow-drop-down-line.svg);
+    width: 18px;
+    height: 18px;
+}
+
+/* the arrow SVG has a baked-in fill, so the disabled state keeps the same
+   glyph and relies on the dimmed field around it */
+
+
+/* --- dropdown popup list ------------------------------------------------- */
+
+/* The popup is a QFrame container (QComboBoxPrivateContainer) wrapping the
+   view. Left unstyled it paints the window colour, which shows as a dark
+   square ring around the rounded list. Painting it the popup colour hides the
+   corner slivers without relying on window translucency, which is not
+   dependable across platforms. */
+QComboBox QFrame {
+    background-color: #202329;
+    border: none;
 }
 
 QAbstractItemView {
-    border: solid black;
-    border-radius: 3px;
-    border-width: 1px;
+    background-color: #202329;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    padding: 4px;
     outline: none;
+    selection-background-color: #2F3442;
+    selection-color: #FFFFFF;
 }
 
 QAbstractItemView::item {
-    min-height: 30px;
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    color: #E8EAED;
+    min-height: 32px;
+    padding-left: 8px;
+    padding-right: 8px;
 }
 
-QAbstractItemView::item::selected {
-    background-color: #26272B;
+QAbstractItemView::item:hover {
+    background-color: #2A2E36;
 }
 
-QAbstractItemView::item::hover {
-    background-color: #2A2C30;
+QAbstractItemView::item:selected {
+    background-color: #2F3442;
+    color: #FFFFFF;
 }
+
+QAbstractItemView::item:disabled {
+    color: #5A5F66;
+}
+
+
+/* --- popup scrollbar ----------------------------------------------------- */
+
+QScrollBar:vertical {
+    background-color: transparent;
+    border: none;
+    width: 10px;
+    margin: 4px 2px 4px 0px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #3C414A;
+    border: none;
+    border-radius: 4px;
+    min-height: 28px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #4E545F;
+}
+
+QScrollBar::handle:vertical:pressed {
+    background-color: #6B76F0;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    background-color: transparent;
+    border: none;
+    height: 0px;
+}
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background-color: transparent;
+}
+
+QScrollBar:horizontal {
+    background-color: transparent;
+    border: none;
+    height: 10px;
+    margin: 0px 4px 2px 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #3C414A;
+    border: none;
+    border-radius: 4px;
+    min-width: 28px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #4E545F;
+}
+
+QScrollBar::handle:horizontal:pressed {
+    background-color: #6B76F0;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    background-color: transparent;
+    border: none;
+    width: 0px;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background-color: transparent;
+}
+
+
+/* --- connect / disconnect button ----------------------------------------- */
+
+/* One button per connection row, not two. The LABEL is the next action
+   ("Connect" / "Disconnect" / "Retry"); the COLOUR below is the current
+   state, published by gui.py as the dynamic property link="..." whose values
+   are the constants in connection_state.py. Qt does not re-evaluate an
+   attribute selector when a property changes, so gui.py does the
+   unpolish/polish pair after setting it.
+
+   The four looks are distinguishable without reading the word:
+     idle           grey outline
+     connecting     amber outline, dimmed (the button is disabled)
+     live           SOLID GREEN -- the row is on air
+     disconnecting  amber outline, dimmed
+     failed         red outline
+
+   Green-on-"Disconnect" is deliberate: the fill states what the row IS, the
+   word states what the click DOES. */
+
+QPushButton#connect {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    font-weight: 500;
+    min-height: 34px;
+    min-width: 108px;
+    max-width: 108px;
+    padding: 0px;
+    outline: none;
+}
+
+/* -- idle: the offered action is "Connect" -- */
+
+QPushButton#connect[link="idle"] {
+    background-color: #1B1D21;
+    border-color: #383C44;
+    color: #E8EAED;
+}
+
+QPushButton#connect[link="idle"]:hover {
+    background-color: #212429;
+    border-color: #43B581;
+    color: #43B581;
+}
+
+QPushButton#connect[link="idle"]:pressed {
+    background-color: #17191C;
+    border-color: #38976C;
+    color: #38976C;
+}
+
+/* disabled here means "the selection is not complete yet"; the tooltip says
+   which of device / server / channel is still missing */
+QPushButton#connect[link="idle"]:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+/* -- in flight: always disabled, never cancellable -- */
+
+QPushButton#connect[link="connecting"],
+QPushButton#connect[link="connecting"]:disabled,
+QPushButton#connect[link="disconnecting"],
+QPushButton#connect[link="disconnecting"]:disabled {
+    background-color: #1B1D21;
+    border-color: #E9A23C;
+    color: #E9A23C;
+}
+
+/* -- live: on air -- */
+
+QPushButton#connect[link="live"] {
+    background-color: #2E7D5B;
+    border-color: #43B581;
+    color: #FFFFFF;
+}
+
+QPushButton#connect[link="live"]:hover {
+    background-color: #35845F;
+    border-color: #5FC79A;
+}
+
+QPushButton#connect[link="live"]:pressed {
+    background-color: #286B4E;
+    border-color: #38976C;
+}
+
+QPushButton#connect[link="live"]:disabled {
+    background-color: #26493C;
+    border-color: #2E5A49;
+    color: #A6C4B5;
+}
+
+/* -- failed: the offered action is "Retry" -- */
+
+QPushButton#connect[link="failed"] {
+    background-color: #1B1D21;
+    border-color: #F87171;
+    color: #F87171;
+}
+
+QPushButton#connect[link="failed"]:hover {
+    background-color: #212429;
+    border-color: #FCA5A5;
+    color: #FCA5A5;
+}
+
+QPushButton#connect[link="failed"]:pressed {
+    background-color: #17191C;
+    border-color: #D85C5C;
+    color: #D85C5C;
+}
+
+QPushButton#connect[link="failed"]:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+/* Last, so they win the specificity tie against the [link="..."] rules above
+   and re-colour the ring without touching the fill. Two rules because a
+   lavender ring on the solid-green live fill is only 2.4:1 against it, and a
+   focus indicator has to be visible against BOTH the thing it surrounds and
+   the panel outside it. White clears 3:1 on both (5.0:1 vs the green fill,
+   15.1:1 vs the panel); lavender clears both on the dark outline states
+   (8.2:1 vs the control well, 7.4:1 vs the panel). */
+QPushButton#connect:focus {
+    border-color: #A9B0F7;
+}
+
+QPushButton#connect[link="live"]:focus {
+    border-color: #FFFFFF;
+}
+
+
+/* --- mute button --------------------------------------------------------- */
 
 QPushButton#mute {
-    border-radius: 2px;
-    background-color: #7289DA;
-    color: white;
-    min-height: 30px;
-    min-width: 80px;
-    max-width: 80px;
+    background-color: #5561E8;
+    border: 1px solid #5561E8;
+    border-radius: 8px;
+    color: #FFFFFF;
+    font-size: 11pt;
+    font-weight: 500;
+    min-height: 34px;
+    min-width: 88px;
+    max-width: 88px;
+    padding: 0px;
+    outline: none;
 }
 
-QPushButton#mute::hover {
-    background-color: #677BC4;
+QPushButton#mute:hover {
+    background-color: #5C68EE;
+    border-color: #6B76F0;
 }
 
-QPushButton#mute::pressed {
-    background-color: #5B6EAE;
+QPushButton#mute:pressed {
+    background-color: #4550D4;
+    border-color: #4550D4;
 }
 
-QLabel#label {
-    font: 11pt "Roboto";
-    color: #8E9297;
+QPushButton#mute:focus {
+    background-color: #5C68EE;
+    border-color: #A9B0F7;
 }
+
+QPushButton#mute:disabled {
+    background-color: #333A5C;
+    border-color: #333A5C;
+    color: #8A90A8;
+}
+
+/* The button is checkable, so muted is a latched colour and not only a word
+   swap. It keeps the word too -- "Resume" -- because colour is never allowed
+   to be the only channel, but an amber button reads across several rows at a
+   glance in a way that reading five labels does not.
+
+   Amber rather than red: muted is a state the user chose and will undo, not
+   a fault. Red is reserved for the failure states.
+
+   These come after the plain rules above: an id + pseudo-state selector ties
+   with another id + pseudo-state selector on specificity, so source order is
+   what decides, and :checked:hover has to be spelled out for the same
+   reason. */
+
+QPushButton#mute:checked {
+    background-color: #E9A23C;
+    border-color: #E9A23C;
+    color: #131417;
+}
+
+QPushButton#mute:checked:hover {
+    background-color: #F0AE50;
+    border-color: #F0AE50;
+    color: #131417;
+}
+
+QPushButton#mute:checked:pressed {
+    background-color: #D08F2E;
+    border-color: #D08F2E;
+    color: #131417;
+}
+
+/* Dark ring, not the lavender used elsewhere: on an amber fill the light
+   ring vanishes (1.8:1) while #131417 reads at 9.5:1 against it. */
+QPushButton#mute:checked:focus {
+    background-color: #F0AE50;
+    border-color: #131417;
+    color: #131417;
+}
+
+/* Should not be reachable -- gui.py clears the mute whenever the row leaves
+   LIVE, and the button is only enabled in LIVE -- but a latched control that
+   greys out without un-latching would be asserting a mute that is not in
+   effect, so it is defined rather than left to the plain :disabled rule. */
+QPushButton#mute:checked:disabled {
+    background-color: #6B5528;
+    border-color: #6B5528;
+    color: #E0D3B8;
+}
+
+
+/* --- add-connection button ----------------------------------------------- */
+
+QPushButton#connection_btn {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #43B581;
+    font-size: 15pt;
+    min-height: 34px;
+    max-height: 34px;
+    min-width: 34px;
+    max-width: 34px;
+    padding: 0px;
+    outline: none;
+}
+
+QPushButton#connection_btn:hover {
+    background-color: #212429;
+    border-color: #43B581;
+    color: #4FC48D;
+}
+
+QPushButton#connection_btn:pressed {
+    background-color: #17191C;
+    border-color: #38976C;
+    color: #38976C;
+}
+
+QPushButton#connection_btn:focus {
+    background-color: #212429;
+    border-color: #6B76F0;
+}
+
+QPushButton#connection_btn:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #3B584B;
+}
+
+
+/* --- generic push buttons (fallback for anything unnamed) ---------------- */
+
+QPushButton {
+    background-color: #1B1D21;
+    border: 1px solid #383C44;
+    border-radius: 8px;
+    color: #E8EAED;
+    font-size: 11pt;
+    min-height: 34px;
+    padding: 0px 16px;
+    outline: none;
+}
+
+QPushButton:hover {
+    background-color: #212429;
+    border-color: #4E545F;
+}
+
+QPushButton:pressed {
+    background-color: #17191C;
+}
+
+QPushButton:focus {
+    border-color: #6B76F0;
+}
+
+QPushButton:disabled {
+    background-color: #1A1B1E;
+    border-color: #2A2D33;
+    color: #5A5F66;
+}
+
+
+/* --- loading spinner inside the mute button ------------------------------ */
 
 QSvgWidget {
     background-color: transparent;
+    border: none;
     max-width: 18px;
     max-height: 18px;
 }
 
-QPushButton#connection_btn {
-    border: solid #282A2F;
-    border-width: 1px;
-    border-radius: 2px;
-    background-color: #36393F;
-    font: 16pt "Roboto";
+
+/* --- live status strip --------------------------------------------------- */
+
+/* Sits in the same "well" surface as the inputs so it reads as instrument
+   panel rather than as another control. */
+QFrame#status {
+    background-color: #1B1D21;
+    border: 1px solid #2A2D33;
+    border-radius: 8px;
+}
+
+/* The generic QLabel rule adds an 8px bottom pad for the column headers;
+   inside the strip that would knock the baseline off centre. */
+QFrame#status QLabel {
+    background-color: transparent;
+    border: none;
+    padding: 0px;
+}
+
+QLabel#status_dot {
+    font-size: 13pt;
+    color: #9AA0A6;
+    padding: 0px 1px 2px 0px;
+}
+
+/* the one word that says whether the stream is alive; the metrics beside it
+   stay at body weight so the eye lands here first */
+QLabel#status_state {
+    font-size: 10pt;
+    font-weight: 500;
+    color: #9AA0A6;
+}
+
+QLabel#status_detail {
+    font-size: 10pt;
+    color: #9AA0A6;
+}
+
+/* State colouring. These selector values are the STATE_* constants in
+   gui.py; the state word is also written out in the label text, so colour
+   is reinforcement and never the only signal. */
+QLabel#status_dot[state="ok"],
+QLabel#status_state[state="ok"] {
     color: #43B581;
-    min-height: 30px;
-    min-width: 30px;
-    max-width: 30px;
 }
 
-QPushButton#connection_btn::hover {
-    background-color: #2A2C30;
+QLabel#status_dot[state="warn"],
+QLabel#status_state[state="warn"] {
+    color: #E9A23C;
 }
 
-QPushButton#connection_btn::pressed {
-    background-color: #26272B;
+QLabel#status_dot[state="fail"],
+QLabel#status_state[state="fail"] {
+    color: #F87171;
+}
+
+QLabel#status_dot[state="idle"],
+QLabel#status_state[state="idle"] {
+    color: #9AA0A6;
+}
+
+
+/* --- status-strip toggles ------------------------------------------------ */
+/* Keyed on the dynamic property role="toggle", not on an object name, so the
+   strip's checkboxes (auto-connect, auto-recover) share one rule set and a
+   third one needs no CSS at all. Qt resolves dynamic-property selectors at
+   stylesheet-apply time, and StatusStrip is built before setStyleSheet(). */
+
+QCheckBox[role="toggle"] {
+    background-color: transparent;
+    color: #9AA0A6;
+    font-size: 10pt;
+    spacing: 7px;
+    padding: 0px;
+    outline: none;
+}
+
+QCheckBox[role="toggle"]:hover {
+    color: #E8EAED;
+}
+
+QCheckBox[role="toggle"]::indicator {
+    background-color: #24262C;
+    border: 1px solid #4E545F;
+    border-radius: 4px;
+    width: 14px;
+    height: 14px;
+}
+
+QCheckBox[role="toggle"]::indicator:hover {
+    border-color: #6B76F0;
+}
+
+/* No image: the checked state is a filled accent square. An SVG tick would
+   need a second asset and would not recolour with the theme. */
+QCheckBox[role="toggle"]::indicator:checked {
+    background-color: #5561E8;
+    border-color: #5561E8;
+}
+
+QCheckBox[role="toggle"]::indicator:checked:hover {
+    background-color: #5C68EE;
+    border-color: #6B76F0;
+}
+
+QCheckBox[role="toggle"]:focus {
+    color: #E8EAED;
+}
+
+QCheckBox[role="toggle"]:focus::indicator {
+    border-color: #6B76F0;
+}
+
+
+/* --- tooltips ------------------------------------------------------------ */
+
+QToolTip {
+    background-color: #131417;
+    border: 1px solid #383C44;
+    border-radius: 6px;
+    color: #E8EAED;
+    font-size: 10pt;
+    padding: 6px 8px;
 }
