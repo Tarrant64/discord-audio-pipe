@@ -14,8 +14,8 @@ on:
   release:
     types: [prereleased]
 
-# Cancel superseded runs instead of paying for them: this is a private repo and
-# windows-latest bills at a 2x minute multiplier.
+# Cancel superseded runs rather than let them finish: only the newest commit on a
+# ref is worth building, and freeing the runner returns that result sooner.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
