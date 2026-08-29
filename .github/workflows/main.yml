@@ -1,13 +1,24 @@
 name: CI
 
-# Two triggers:
+# Three triggers:
+#   * push to feature/** - GitHub only shows the workflow_dispatch "Run workflow"
+#     button for workflows that exist on the DEFAULT branch. This workflow lives on
+#     a feature branch, so without a push trigger the branch would never build.
 #   * workflow_dispatch - build both legs on demand from the Actions tab.
 #   * release (prereleased) - original behaviour: build and attach the exe to the
 #     prerelease as an asset.
 on:
+  push:
+    branches: [ 'feature/**' ]
   workflow_dispatch:
   release:
     types: [prereleased]
+
+# Cancel superseded runs instead of paying for them: this is a private repo and
+# windows-latest bills at a 2x minute multiplier.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # Needed only by the release-asset upload step, which uses the auto-provided
 # GITHUB_TOKEN. No other secrets are used anywhere in this workflow, and a Discord
